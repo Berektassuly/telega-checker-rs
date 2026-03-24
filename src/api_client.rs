@@ -116,13 +116,16 @@ impl ApiClient {
 
     /// Check if a Telegram ID exists in the Telega call infrastructure.
     ///
-    /// This method implements a **retry-on-expired-session** pattern:
-    /// 1. Acquire a read lock on session_key and attempt the lookup.
-    /// 2. If the API returns an auth error (or session_key is missing),
-    ///    call `authenticate()` to refresh the key and retry ONCE.
-    /// 3. This prevents infinite retry loops while handling legitimate expiration.
+    /// Implements **retry-on-expired-session** with double-checked locking:
+    /// 1. Snapshot the current session key.
+    /// 2. Attempt the lookup.
+    /// 3. On failure, call `refresh_session(old_key)` which only hits the
+    ///    auth API if no other task has already refreshed the key.
+    /// 4. Retry exactly once with the fresh key.
     pub async fn check_id(&self, telegram_id: i64) -> Result<bool> {
-        // First attempt — use existing session key (or authenticate if none)
+        // Snapshot the current key before the attempt
+        let old_key = self.session_key.read().await.clone();
+
         match self.try_lookup(telegram_id).await {
             Ok(found) => Ok(found),
             Err(e) => {
@@ -130,8 +133,8 @@ impl ApiClient {
                     "Lookup failed (likely expired session): {}. Refreshing session_key...",
                     e
                 );
-                // Refresh the session key
-                self.authenticate().await.context(
+                // Refresh only if nobody else already did
+                self.refresh_session(old_key).await.context(
                     "Failed to re-authenticate after expired session",
                 )?;
                 // Retry exactly once with the fresh key
@@ -140,6 +143,58 @@ impl ApiClient {
                     .context("Lookup failed even after session refresh")
             }
         }
+    }
+
+    /// Refresh the session key using double-checked locking.
+    ///
+    /// If another task already refreshed the key (i.e. the current key differs
+    /// from `old_key`), this is a no-op — avoids redundant auth API calls.
+    async fn refresh_session(&self, old_key: Option<String>) -> Result<()> {
+        let mut guard = self.session_key.write().await;
+
+        // Another task already refreshed the key while we were waiting
+        if *guard != old_key && guard.is_some() {
+            info!("Session key already refreshed by another task, skipping auth");
+            return Ok(());
+        }
+
+        // We're first — perform the actual auth request
+        let session_data = serde_json::json!({
+            "device_id": "telega_checker_bot",
+            "version": 2,
+            "client_version": "android_8",
+            "client_type": "SDK_ANDROID"
+        })
+        .to_string();
+
+        let form_data = [
+            ("application_key", self.application_key.as_str()),
+            ("session_data", &session_data),
+        ];
+
+        debug!("Authenticating with okcdn.ru API (refresh)...");
+
+        let resp = self
+            .http
+            .post(format!("{BASE_URL}/api/auth/anonymLogin"))
+            .form(&form_data)
+            .send()
+            .await
+            .context("Failed to send auth request")?;
+
+        let status = resp.status();
+        let body = resp.text().await.context("Failed to read auth response body")?;
+
+        if !status.is_success() {
+            return Err(anyhow!("Auth failed with status {}: {}", status, body));
+        }
+
+        let auth: AuthResponse =
+            serde_json::from_str(&body).context("Failed to parse auth response JSON")?;
+
+        *guard = Some(auth.session_key);
+        info!("Successfully refreshed session_key");
+        Ok(())
     }
 
     /// Internal: attempt a single lookup request.

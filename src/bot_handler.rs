@@ -28,41 +28,34 @@ pub struct AppState {
 
 /// Three-tier lookup: moka cache → SQLite → okcdn.ru API.
 ///
-/// Flow:
-/// 1. Check in-memory cache (instant, no I/O).
-/// 2. If cache miss, check SQLite (fast local I/O).
-///    - If found in DB, populate cache and return.
-/// 3. If DB miss, hit the upstream API.
-///    - Save positive results to both DB and cache.
-///    - Save negative results to cache only (with shorter TTL via cache policy).
+/// Uses `try_get_with` to prevent cache stampede — concurrent requests for
+/// the same `telegram_id` are coalesced: only the first caller executes
+/// the closure, the rest wait and receive the cached result.
 async fn check_user(telegram_id: i64, state: &AppState) -> Result<bool> {
-    // ── Layer 1: In-memory cache (moka) ──
-    if let Some(cached) = state.cache.get(&telegram_id).await {
-        info!("Cache HIT for ID {}: {}", telegram_id, cached);
-        return Ok(cached);
-    }
+    let pool = state.pool.clone();
+    let api = state.api.clone();
 
-    // ── Layer 2: SQLite persistent storage ──
-    let in_db = db::check_telega_id(&state.pool, telegram_id).await?;
-    if in_db {
-        info!("DB HIT for ID {}", telegram_id);
-        // Populate cache with positive result
-        state.cache.insert(telegram_id, true).await;
-        return Ok(true);
-    }
+    let found = state
+        .cache
+        .try_get_with(telegram_id, async move {
+            // ── Layer 2: SQLite persistent storage ──
+            if db::check_telega_id(&pool, telegram_id).await? {
+                info!("DB HIT for ID {}", telegram_id);
+                return Ok(true);
+            }
 
-    // ── Layer 3: Upstream API call ──
-    info!("Cache & DB MISS for ID {}. Querying API...", telegram_id);
-    let found = state.api.check_id(telegram_id).await?;
+            // ── Layer 3: Upstream API call ──
+            info!("Cache & DB MISS for ID {}. Querying API...", telegram_id);
+            let api_result = api.check_id(telegram_id).await?;
 
-    if found {
-        // Persist positive results to both DB and cache
-        db::save_telega_id(&state.pool, telegram_id).await?;
-        state.cache.insert(telegram_id, true).await;
-    } else {
-        // Cache negative results (cache TTL handles expiration)
-        state.cache.insert(telegram_id, false).await;
-    }
+            if api_result {
+                db::save_telega_id(&pool, telegram_id).await?;
+            }
+
+            Ok::<bool, anyhow::Error>(api_result)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Lookup failed: {}", e))?;
 
     Ok(found)
 }
@@ -200,6 +193,7 @@ pub async fn handle_inline_query(
 
     // In teloxide 0.17, use .into() to convert to InlineQueryResult
     bot.answer_inline_query(q.id, vec![article.into()])
+        .cache_time(300) // 5 minutes — explicit control over Telegram-side caching
         .await?;
 
     Ok(())
