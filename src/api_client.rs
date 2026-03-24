@@ -14,13 +14,23 @@ struct AuthResponse {
     session_key: String,
 }
 
-/// A single ID entry returned by the lookup endpoint.
+/// The nested external_user_id object inside each lookup result.
+/// API format: {"id": "<telegram_id>", "ok_anonym": false}
 #[derive(Debug, Deserialize)]
-struct IdEntry {
+struct ExternalUserId {
     id: String,
 }
 
+/// A single entry in the lookup response `ids` array.
+/// API format: {"ok_user_id": 123, "external_user_id": {"id": "...", "ok_anonym": false}}
+#[derive(Debug, Deserialize)]
+struct IdEntry {
+    external_user_id: ExternalUserId,
+}
+
 /// Response from the getOkIdsByExternalIds endpoint.
+/// On success: {"ids": [...]}
+/// On error/not-found: {"error_code": 4, ...} — parsed with empty `ids` via #[serde(default)]
 #[derive(Debug, Deserialize)]
 struct LookupResponse {
     #[serde(default)]
@@ -187,8 +197,9 @@ impl ApiClient {
             serde_json::from_str(&body).context("Failed to parse lookup response JSON")?;
 
         // Check if the returned `ids` array contains our target ID
+        // Response nests it: {"ids": [{"ok_user_id": ..., "external_user_id": {"id": "TARGET"}}]}
         let target = telegram_id.to_string();
-        let found = lookup.ids.iter().any(|entry| entry.id == target);
+        let found = lookup.ids.iter().any(|entry| entry.external_user_id.id == target);
 
         debug!(
             "Lookup result for {}: {}",
