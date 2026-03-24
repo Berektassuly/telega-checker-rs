@@ -123,6 +123,20 @@ async fn main() -> Result<()> {
                     })
                     .endpoint(bot_handler::handle_left_chat_member),
                 )
+                // Mention lookup in groups: @bot_username <id>
+                .branch(
+                    dptree::filter_map(|msg: Message| {
+                        if bot_handler::is_group_chat(&msg) {
+                            if let Some(text) = msg.text() {
+                                if text.starts_with('@') {
+                                    return Some(msg);
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .endpoint(bot_handler::handle_mention_lookup),
+                )
                 // Passively track users who send messages in groups
                 .branch(
                     dptree::filter_map(|msg: Message| {

@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use teloxide::prelude::*;
 use teloxide::types::{
     ChatKind, InlineQueryResult, InlineQueryResultArticle, InputMessageContent,
-    InputMessageContentText,
+    InputMessageContentText, Me,
 };
 use tracing::{debug, error, info};
 
@@ -206,6 +206,67 @@ pub async fn handle_inline_query(
     bot.answer_inline_query(q.id, vec![article.into()])
         .cache_time(300) // 5 minutes — explicit control over Telegram-side caching
         .await?;
+
+    Ok(())
+}
+
+// ─── Group mention lookup handler ───────────────────────────────────────────
+
+/// Handle `@bot_username <telegram_id>` mentions in group/supergroup chats.
+/// Uses the auto-injected `Me` to dynamically resolve the bot's username.
+pub async fn handle_mention_lookup(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+    me: Me,
+) -> Result<(), teloxide::RequestError> {
+    // Resolve the bot's username at runtime
+    let bot_username = match me.username() {
+        Some(u) => u,
+        None => return Ok(()),
+    };
+
+    let text = match msg.text() {
+        Some(t) => t.trim(),
+        None => return Ok(()),
+    };
+
+    // Check if the message starts with @bot_username (case-insensitive)
+    let mention = format!("@{}", bot_username);
+    if !text.to_lowercase().starts_with(&mention.to_lowercase()) {
+        return Ok(());
+    }
+
+    // Extract everything after the mention and try to parse as a Telegram ID
+    let remainder = text[mention.len()..].trim();
+    let telegram_id: i64 = match remainder.parse() {
+        Ok(id) if id > 0 => id,
+        _ => return Ok(()), // Silently ignore invalid input in groups
+    };
+
+    // Log the bot user (fire-and-forget)
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
+    if let Err(e) = db::log_bot_user(&state.pool, user_id, username).await {
+        error!("Failed to log bot user: {}", e);
+    }
+
+    // Run the three-tier lookup
+    let (reply_text, result_short) = match check_user(telegram_id, &state).await {
+        Ok(true) => ("✅ ДА — этот ID зарегистрирован в Telega.", "YES"),
+        Ok(false) => ("❌ НЕТ — этот ID не найден в Telega.", "NO"),
+        Err(e) => {
+            error!("Mention lookup error for ID {}: {}", telegram_id, e);
+            ("⚠️ Ошибка при проверке.", "ERROR")
+        }
+    };
+
+    // Log the request
+    if let Err(e) = db::log_request(&state.pool, user_id, telegram_id, result_short).await {
+        error!("Failed to log request: {}", e);
+    }
+
+    bot.send_message(msg.chat.id, reply_text).await?;
 
     Ok(())
 }
