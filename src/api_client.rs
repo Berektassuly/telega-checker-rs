@@ -4,6 +4,16 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Distinguishes auth failures (worth retrying with a fresh session)
+/// from other API errors (should be propagated as-is).
+#[derive(Debug)]
+enum LookupError {
+    /// 401/403 — session likely expired, retry after refresh.
+    Auth(anyhow::Error),
+    /// Any other failure — do NOT refresh session.
+    Other(anyhow::Error),
+}
+
 const BASE_URL: &str = "https://calls.okcdn.ru";
 
 // ─── API response types ─────────────────────────────────────────────────────
@@ -128,9 +138,9 @@ impl ApiClient {
 
         match self.try_lookup(telegram_id).await {
             Ok(found) => Ok(found),
-            Err(e) => {
+            Err(LookupError::Auth(e)) => {
                 warn!(
-                    "Lookup failed (likely expired session): {}. Refreshing session_key...",
+                    "Lookup failed (expired session): {}. Refreshing session_key...",
                     e
                 );
                 // Refresh only if nobody else already did
@@ -140,7 +150,14 @@ impl ApiClient {
                 // Retry exactly once with the fresh key
                 self.try_lookup(telegram_id)
                     .await
+                    .map_err(|e| match e {
+                        LookupError::Auth(e) | LookupError::Other(e) => e,
+                    })
                     .context("Lookup failed even after session refresh")
+            }
+            Err(LookupError::Other(e)) => {
+                // Non-auth error (5xx, 429, network) — don't touch the session
+                Err(e.context("Lookup API error (not auth-related)"))
             }
         }
     }
@@ -202,13 +219,15 @@ impl ApiClient {
     /// POST https://calls.okcdn.ru/api/vchat/getOkIdsByExternalIds
     /// Content-Type: application/x-www-form-urlencoded
     /// Body: application_key=...&session_key=...&externalIds=[{JSON}]
-    async fn try_lookup(&self, telegram_id: i64) -> Result<bool> {
+    async fn try_lookup(&self, telegram_id: i64) -> std::result::Result<bool, LookupError> {
         // Read the session key without blocking writers longer than needed
         let session_key = {
             let guard = self.session_key.read().await;
             guard
                 .clone()
-                .ok_or_else(|| anyhow!("No session_key available — need to authenticate first"))?
+                .ok_or_else(|| {
+                    LookupError::Auth(anyhow!("No session_key available — need to authenticate first"))
+                })?
         };
 
         // Build the externalIds JSON array as a string (form-field value)
@@ -234,18 +253,22 @@ impl ApiClient {
             .form(&form_data)
             .send()
             .await
-            .context("Failed to send lookup request")?;
+            .map_err(|e| LookupError::Other(anyhow::Error::from(e).context("Failed to send lookup request")))?;
 
         let status = resp.status();
-        let body = resp.text().await.context("Failed to read lookup response body")?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| LookupError::Other(anyhow::Error::from(e).context("Failed to read lookup response body")))?;
 
-        // Treat non-2xx as a potential auth/session error to trigger retry
         if !status.is_success() {
-            return Err(anyhow!(
-                "Lookup API returned status {}: {}",
-                status,
-                body
-            ));
+            let err = anyhow!("Lookup API returned status {}: {}", status, body);
+            // Only treat 401/403 as auth errors worth retrying
+            return if status.as_u16() == 401 || status.as_u16() == 403 {
+                Err(LookupError::Auth(err))
+            } else {
+                Err(LookupError::Other(err))
+            };
         }
 
         let lookup: LookupResponse =
