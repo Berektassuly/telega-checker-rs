@@ -2,7 +2,7 @@
 
 *Read this in other languages: [English](README.md), [Русский](docs/README_RU.md).*
 
-High-throughput Telegram bot for detecting accounts compromised by the **Telega** man-in-the-middle (MITM) fork client. Written in Rust. Accepts a Telegram user ID via direct message or inline query and returns a binary determination: present or absent in Telega's VoIP backend infrastructure.
+High-throughput Telegram bot for detecting accounts compromised by the **Telega** man-in-the-middle (MITM) fork client. Written in Rust. Operates in two modes: **reactive** (accepts a Telegram user ID via direct message or inline query) and **passive** (silently tracks group members and runs a daily scheduled scan, reporting compromised accounts). Returns a binary determination: present or absent in Telega's VoIP backend infrastructure.
 
 This is the production-grade Rust port of [notelega](https://github.com/hlnmplus/notelega) (Python/aiogram PoC). The Python implementation validates the detection concept; this implementation is engineered for sustained concurrent load, sub-microsecond cache reads, built-in cache stampede prevention, and a memory footprint two orders of magnitude smaller than the CPython equivalent.
 
@@ -21,6 +21,7 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [Configuration](#configuration)
 - [Deployment](#deployment)
 - [Usage](#usage)
+- [Passive Group Monitoring](#passive-group-monitoring)
 - [Database Schema](#database-schema)
 - [Operational Security Notes](#operational-security-notes)
 
@@ -97,7 +98,27 @@ The session key expires periodically. The implementation handles this transparen
 
 ## Architecture
 
-The bot implements a three-tier lookup with distinct latency and persistence characteristics at each level.
+The bot implements a three-tier lookup with distinct latency and persistence characteristics at each level. In addition to reactive lookups, the bot operates as a passive group monitor with a daily scheduled scanner.
+
+### Passive Monitoring Pipeline
+
+When added to a group, the bot silently tracks members through three event sources:
+
+1. **Message observation** — every message in a group records `(chat_id, user_id)` to the `chat_members` table. A moka dedup cache (5 min TTL, 50K capacity) prevents DB I/O on every message.
+2. **Join events** — `NewChatMembers` updates are tracked immediately (bypassing dedup).
+3. **Leave events** — `LeftChatMember` triggers a soft-delete (`is_active = FALSE`).
+
+### Daily Scan
+
+A `tokio-cron-scheduler` job runs at **09:00 UTC** daily:
+
+1. Fetches all distinct `chat_id` values with active members from `chat_members`.
+2. For each chat, checks all active `user_id` values through the three-tier lookup.
+3. Limits concurrent API checks to 10 via `futures::stream::buffer_unordered`.
+4. Sends an aggregated HTML report to chats with positive hits. Silent if no hits.
+5. **Self-cleaning**: if sending fails with `BotKicked` / `ChatNotFound` / similar errors, all members for that chat are soft-deleted to prevent wasted resources in future scans.
+
+### Three-Tier Lookup
 
 ```
 Telegram Update (Message | InlineQuery)
@@ -319,13 +340,15 @@ telega-checker-rs/
 ├── docker-compose.yml      # Production deployment with persistent volume
 ├── .env.example            # Environment variable template
 ├── docs/
+│   ├── README_RU.md        # Russian version of README
 │   └── DEPLOY.md           # Extended deployment instructions
 └── src/
-    ├── main.rs             # Entrypoint: config, pool, cache, dispatcher setup
+    ├── main.rs             # Entrypoint: config, pool, caches, dispatcher + scheduler setup
     ├── config.rs           # AppConfig: env var loading (TELOXIDE_TOKEN, DATABASE_URL, APPLICATION_KEY)
     ├── api_client.rs       # ApiClient: calls.okcdn.ru auth + lookup with session refresh
-    ├── bot_handler.rs      # Telegram handlers: /start, message, inline query; three-tier lookup
-    └── db.rs               # SQLite schema init, known_users CRUD, analytics logging
+    ├── bot_handler.rs      # Telegram handlers: /start, message, inline, group tracking; three-tier lookup
+    ├── scheduler.rs        # Daily cron scan: iterates active chats, checks members, sends reports
+    └── db.rs               # SQLite schema init, known_users + chat_members CRUD, analytics logging
 ```
 
 ---
@@ -435,6 +458,40 @@ Displays usage instructions and a link to the OSINT article on Telega's intercep
 
 ---
 
+## Passive Group Monitoring
+
+When added to a group or supergroup, the bot operates silently as a passive monitor.
+
+### How It Works
+
+1. **Automatic tracking**: The bot observes all messages and join/leave events. No commands needed — simply add the bot to the group.
+2. **Daily scan at 09:00 UTC**: The bot checks every tracked member through the three-tier lookup (moka → SQLite → okcdn.ru API).
+3. **Report on detection**: If compromised accounts are found, the bot sends a single summary:
+
+```
+Daily Scan Report
+
+The following members are using the compromised Telega client:
+
+1. User
+2. User
+```
+
+4. **Silent on clean results**: If no Telega users are found, no message is sent.
+5. **Self-cleaning**: If the bot is removed from a group, it automatically deactivates all tracking records for that group.
+
+### Group Requirements
+
+- The bot must have permission to read messages in the group.
+- No admin privileges are required — the bot only reads and sends messages.
+- The bot tracks users passively; it does not ban, mute, or restrict anyone.
+
+### Data Retention
+
+Tracking uses a soft-delete model. When a user leaves a group or the bot is removed, records are marked `is_active = FALSE` rather than deleted. This preserves historical analytics while excluding inactive members from future scans.
+
+---
+
 ## Database Schema
 
 SQLite with WAL mode enabled (`PRAGMA journal_mode=WAL`) for concurrent read performance.
@@ -474,6 +531,19 @@ CREATE TABLE IF NOT EXISTS requests_log (
     queried_id INTEGER NOT NULL,
     result     TEXT    NOT NULL,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### `chat_members` (passive monitoring)
+
+Tracks which users are present in which groups. Uses a soft-delete pattern (`is_active`) to preserve history.
+
+```sql
+CREATE TABLE IF NOT EXISTS chat_members (
+    chat_id   INTEGER NOT NULL,
+    user_id   INTEGER NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (chat_id, user_id)
 );
 ```
 
