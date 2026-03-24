@@ -272,7 +272,9 @@ impl ApiClient {
         }
 
         let lookup: LookupResponse =
-            serde_json::from_str(&body).context("Failed to parse lookup response JSON")?;
+            serde_json::from_str(&body)
+                .context("Failed to parse lookup response JSON")
+                .map_err(LookupError::Other)?;
 
         // Check if the returned `ids` array contains our target ID
         // Response nests it: {"ids": [{"ok_user_id": ..., "external_user_id": {"id": "TARGET"}}]}
