@@ -1,5 +1,7 @@
 # telega-checker-rs
 
+*Read this in other languages: [English](README.md), [Русский](docs/README_RU.md).*
+
 High-throughput Telegram bot for detecting accounts compromised by the **Telega** man-in-the-middle (MITM) fork client. Written in Rust. Accepts a Telegram user ID via direct message or inline query and returns a binary determination: present or absent in Telega's VoIP backend infrastructure.
 
 This is the production-grade Rust port of [notelega](https://github.com/hlnmplus/notelega) (Python/aiogram PoC). The Python implementation validates the detection concept; this implementation is engineered for sustained concurrent load, sub-microsecond cache reads, built-in cache stampede prevention, and a memory footprint two orders of magnitude smaller than the CPython equivalent.
@@ -21,8 +23,6 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [Usage](#usage)
 - [Database Schema](#database-schema)
 - [Operational Security Notes](#operational-security-notes)
-- [References](#references)
-- [License](#license)
 
 ---
 
