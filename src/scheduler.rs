@@ -138,7 +138,8 @@ async fn scan_chat(bot: &Bot, state: &AppState, chat_id: i64) -> Result<()> {
                 teloxide::ApiError::BotKicked
                     | teloxide::ApiError::BotKickedFromSupergroup
                     | teloxide::ApiError::ChatNotFound
-                    | teloxide::ApiError::NotEnoughRightsToSendMessage
+                    | teloxide::ApiError::UserDeactivated
+                    | teloxide::ApiError::GroupDeactivated
             ) =>
         {
             warn!(
