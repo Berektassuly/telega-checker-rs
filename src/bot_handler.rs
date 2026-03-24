@@ -221,10 +221,7 @@ pub async fn handle_mention_lookup(
     me: Me,
 ) -> Result<(), teloxide::RequestError> {
     // Resolve the bot's username at runtime
-    let bot_username = match me.username() {
-        Some(u) => u,
-        None => return Ok(()),
-    };
+    let bot_username = me.username();
 
     let text = match msg.text() {
         Some(t) => t.trim(),
