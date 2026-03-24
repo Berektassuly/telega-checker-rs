@@ -64,17 +64,24 @@ async fn check_user(telegram_id: i64, state: &AppState) -> Result<bool> {
 
 /// Handle the /start command with a greeting message.
 pub async fn handle_start(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
-    let greeting = concat!(
-        "👋 Привет\\! Я — *TelegaChecker*\\.\n\n",
-        "Отправь мне Telegram ID \\(числом\\), и я проверю, ",
-        "зарегистрирован ли он в приложении Telega\\.\n\n",
-        "Ответ будет: *ДА* или *НЕТ*\\.\n\n",
-        "Также можешь использовать инлайн\\-режим: ",
-        "`@имя\\_бота 12345`",
-    );
+    let greeting = r#"Добро пожаловать в TelegaChecker!
+
+Telega Checker специализированный инструмент для проверки аккаунтов. Основная задача определение, числится ли конкретный Telegram ID в инфраструктуре Telega.
+
+Как пользоваться ботом:
+• Просто отправьте мне Telegram ID (только цифры, например: 123456789).
+• Используйте inline-режим в любом чате: введите @telega_checker_rs_bot 123456789.
+В ответ я мгновенно сообщу, найден ли этот пользователь в системе.
+
+О приватности:
+Статья о возможных подводных камнях и уязвимостях при использовании Telega:
+<a href="https://telegra.ph/How-Telega-Intercepts-Your-Messages-and-Data-03-24">Как Telega перехватывает ваши сообщения и данные</a>
+
+Связь с разработчиком:
+По вопросам сотрудничества, баг-репортам или предложениям обращайтесь: @Berektassuly"#;
 
     bot.send_message(msg.chat.id, greeting)
-        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+        .parse_mode(teloxide::types::ParseMode::Html)
         .await?;
 
     Ok(())
