@@ -92,37 +92,61 @@ async fn main() -> Result<()> {
         .context("Failed to start daily scan scheduler")?;
 
     let handler = dptree::entry()
-        // Handle /start command
+        // ── All message-based handlers under a single filter_message ──
         .branch(
             Update::filter_message()
-                .filter_command::<BotCommands>()
-                .endpoint(commands_handler),
+                // /start command (highest priority)
+                .branch(
+                    dptree::entry()
+                        .filter_command::<BotCommands>()
+                        .endpoint(commands_handler),
+                )
+                // New chat members joining groups
+                .branch(
+                    dptree::filter_map(|msg: Message| {
+                        if msg.new_chat_members().is_some() {
+                            Some(msg)
+                        } else {
+                            None
+                        }
+                    })
+                    .endpoint(bot_handler::handle_new_chat_members),
+                )
+                // Member leaving a group
+                .branch(
+                    dptree::filter_map(|msg: Message| {
+                        if msg.left_chat_member().is_some() {
+                            Some(msg)
+                        } else {
+                            None
+                        }
+                    })
+                    .endpoint(bot_handler::handle_left_chat_member),
+                )
+                // Passively track users who send messages in groups
+                .branch(
+                    dptree::filter_map(|msg: Message| {
+                        if bot_handler::is_group_chat(&msg) {
+                            Some(msg)
+                        } else {
+                            None
+                        }
+                    })
+                    .endpoint(bot_handler::handle_group_message),
+                )
+                // Plain text messages (ID lookups) — private chats only
+                .branch(
+                    dptree::filter_map(|msg: Message| {
+                        if bot_handler::is_private_chat(&msg) {
+                            Some(msg)
+                        } else {
+                            None
+                        }
+                    })
+                    .endpoint(bot_handler::handle_message),
+                ),
         )
-        // Handle new chat members joining groups
-        .branch(
-            Update::filter_message()
-                .filter(|msg: Message| msg.new_chat_members().is_some())
-                .endpoint(bot_handler::handle_new_chat_members),
-        )
-        // Handle member leaving a group
-        .branch(
-            Update::filter_message()
-                .filter(|msg: Message| msg.left_chat_member().is_some())
-                .endpoint(bot_handler::handle_left_chat_member),
-        )
-        // Passively track users who send messages in groups
-        .branch(
-            Update::filter_message()
-                .filter(bot_handler::is_group_chat)
-                .endpoint(bot_handler::handle_group_message),
-        )
-        // Handle plain text messages (ID lookups) — private chats only
-        .branch(
-            Update::filter_message()
-                .filter(bot_handler::is_private_chat)
-                .endpoint(bot_handler::handle_message),
-        )
-        // Handle inline queries
+        // ── Inline queries ──
         .branch(
             Update::filter_inline_query().endpoint(bot_handler::handle_inline_query),
         );
