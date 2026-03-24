@@ -1,14 +1,15 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use moka::future::Cache;
 use sqlx::SqlitePool;
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineQueryResult, InlineQueryResultArticle, InputMessageContent,
+    ChatKind, InlineQueryResult, InlineQueryResultArticle, InputMessageContent,
     InputMessageContentText,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::api_client::ApiClient;
 use crate::db;
@@ -22,6 +23,10 @@ pub struct AppState {
     /// - Negative entries (false): shorter TTL to avoid permanent false negatives.
     pub cache: Cache<i64, bool>,
     pub api: Arc<ApiClient>,
+    /// Deduplication cache for group member tracking.
+    /// Maps (chat_id, user_id) → () with a short TTL (~5 min) to avoid
+    /// hitting the database on every single message in active chats.
+    pub tracking_cache: Cache<(i64, i64), ()>,
 }
 
 // ─── Core lookup logic ──────────────────────────────────────────────────────
@@ -31,7 +36,7 @@ pub struct AppState {
 /// Uses `try_get_with` to prevent cache stampede — concurrent requests for
 /// the same `telegram_id` are coalesced: only the first caller executes
 /// the closure, the rest wait and receive the cached result.
-async fn check_user(telegram_id: i64, state: &AppState) -> Result<bool> {
+pub async fn check_user(telegram_id: i64, state: &AppState) -> Result<bool> {
     let pool = state.pool.clone();
     let api = state.api.clone();
 
@@ -87,9 +92,9 @@ Telega Checker специализированный инструмент для 
     Ok(())
 }
 
-// ─── Text message handler ───────────────────────────────────────────────────
+// ─── Text message handler (private chats only) ─────────────────────────────
 
-/// Handle plain text messages. Expects a numeric Telegram ID.
+/// Handle plain text messages in private chats. Expects a numeric Telegram ID.
 pub async fn handle_message(
     bot: Bot,
     msg: Message,
@@ -204,4 +209,117 @@ pub async fn handle_inline_query(
         .await?;
 
     Ok(())
+}
+
+// ─── Group member tracking handlers ─────────────────────────────────────────
+
+/// Passively track users who send messages in group/supergroup chats.
+/// Uses a moka dedup cache to avoid DB writes on every single message.
+pub async fn handle_group_message(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    // Ignore non-group chats (safety — the dispatcher filter should prevent this)
+    let _ = bot;
+
+    let user = match msg.from.as_ref() {
+        Some(u) if !u.is_bot => u,
+        _ => return Ok(()),
+    };
+
+    let chat_id = msg.chat.id.0;
+    let user_id = user.id.0 as i64;
+    let pair = (chat_id, user_id);
+
+    // Check dedup cache — if recently tracked, skip the DB call
+    if state.tracking_cache.get(&pair).await.is_some() {
+        return Ok(());
+    }
+
+    // Insert into dedup cache (short TTL will auto-expire)
+    state.tracking_cache.insert(pair, ()).await;
+
+    // Persist to DB (fire-and-forget)
+    if let Err(e) = db::track_chat_member(&state.pool, chat_id, user_id).await {
+        error!(chat_id, user_id, "Failed to track chat member: {}", e);
+    } else {
+        debug!(chat_id, user_id, "Tracked chat member");
+    }
+
+    Ok(())
+}
+
+/// Handle new members joining a group chat.
+pub async fn handle_new_chat_members(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    let _ = bot;
+
+    let new_members = match msg.new_chat_members() {
+        Some(members) => members,
+        None => return Ok(()),
+    };
+
+    let chat_id = msg.chat.id.0;
+
+    for user in new_members {
+        // Skip bots
+        if user.is_bot {
+            continue;
+        }
+
+        let user_id = user.id.0 as i64;
+
+        // Update dedup cache
+        state.tracking_cache.insert((chat_id, user_id), ()).await;
+
+        if let Err(e) = db::track_chat_member(&state.pool, chat_id, user_id).await {
+            error!(chat_id, user_id, "Failed to track new chat member: {}", e);
+        } else {
+            info!(chat_id, user_id, "Tracked new chat member (join)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a member leaving a group chat. Soft-deletes them from db.
+pub async fn handle_left_chat_member(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    let _ = bot;
+
+    let left_user = match msg.left_chat_member() {
+        Some(user) => user,
+        None => return Ok(()),
+    };
+
+    let chat_id = msg.chat.id.0;
+    let user_id = left_user.id.0 as i64;
+
+    // Remove from dedup cache
+    state.tracking_cache.remove(&(chat_id, user_id)).await;
+
+    if let Err(e) = db::untrack_chat_member(&state.pool, chat_id, user_id).await {
+        error!(chat_id, user_id, "Failed to untrack left chat member: {}", e);
+    } else {
+        info!(chat_id, user_id, "Untracked chat member (left)");
+    }
+
+    Ok(())
+}
+
+/// Filter predicate: returns true if the message is from a group or supergroup.
+pub fn is_group_chat(msg: &Message) -> bool {
+    matches!(msg.chat.kind, ChatKind::Public(_))
+}
+
+/// Filter predicate: returns true if the message is from a private chat.
+pub fn is_private_chat(msg: &Message) -> bool {
+    matches!(msg.chat.kind, ChatKind::Private(_))
 }

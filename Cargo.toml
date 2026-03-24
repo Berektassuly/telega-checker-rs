@@ -33,3 +33,9 @@ anyhow = "1"
 # Structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async cron scheduler for daily background tasks
+tokio-cron-scheduler = "0.13"
+
+# Stream utilities for concurrency control (buffer_unordered)
+futures = "0.3"

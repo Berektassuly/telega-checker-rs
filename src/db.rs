@@ -46,6 +46,18 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Chat members: maps users to groups with a soft-delete flag
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chat_members (
+            chat_id   INTEGER NOT NULL,
+            user_id   INTEGER NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+            PRIMARY KEY (chat_id, user_id)
+        )"
+    )
+    .execute(pool)
+    .await?;
+
     info!("Database schema initialized");
     Ok(())
 }
@@ -115,4 +127,64 @@ pub async fn log_request(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ─── chat_members operations ────────────────────────────────────────────────
+
+/// Track a user in a group chat. If the user was previously soft-deleted,
+/// re-activate them. Uses INSERT ... ON CONFLICT to avoid duplicates.
+pub async fn track_chat_member(pool: &SqlitePool, chat_id: i64, user_id: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO chat_members (chat_id, user_id, is_active)
+         VALUES (?, ?, TRUE)
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET is_active = TRUE"
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Soft-delete a user from a specific chat (e.g. when they leave the group).
+pub async fn untrack_chat_member(pool: &SqlitePool, chat_id: i64, user_id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE chat_members SET is_active = FALSE WHERE chat_id = ? AND user_id = ?"
+    )
+    .bind(chat_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Soft-delete ALL members for a chat (e.g. when the bot is kicked).
+/// Prevents wasting resources on future scans for this chat.
+pub async fn deactivate_chat(pool: &SqlitePool, chat_id: i64) -> Result<()> {
+    sqlx::query("UPDATE chat_members SET is_active = FALSE WHERE chat_id = ?")
+        .bind(chat_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Get all distinct chat IDs that have at least one active member.
+pub async fn get_active_chat_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
+    let rows = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT chat_id FROM chat_members WHERE is_active = TRUE"
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Get all active user IDs for a specific chat.
+pub async fn get_active_members(pool: &SqlitePool, chat_id: i64) -> Result<Vec<i64>> {
+    let rows = sqlx::query_scalar::<_, i64>(
+        "SELECT user_id FROM chat_members WHERE chat_id = ? AND is_active = TRUE"
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }

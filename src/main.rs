@@ -2,6 +2,7 @@ mod api_client;
 mod bot_handler;
 mod config;
 mod db;
+mod scheduler;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,14 @@ async fn main() -> Result<()> {
         .time_to_live(Duration::from_secs(24 * 60 * 60)) // 24 hours
         .build();
 
+    // ── Initialize tracking dedup cache ──
+    // Short TTL (5 minutes) to deduplicate (chat_id, user_id) pairs
+    // and avoid hitting the database on every message in active groups.
+    let tracking_cache: Cache<(i64, i64), ()> = Cache::builder()
+        .max_capacity(50_000)
+        .time_to_live(Duration::from_secs(5 * 60)) // 5 minutes
+        .build();
+
     // ── Initialize API client & perform initial authentication ──
     let api = Arc::new(api_client::ApiClient::new(cfg.application_key.clone()));
     api.authenticate()
@@ -70,11 +79,17 @@ async fn main() -> Result<()> {
         pool,
         cache,
         api,
+        tracking_cache,
     };
 
     // ── Setup teloxide bot & dispatcher ──
     let bot = Bot::new(&cfg.bot_token);
     info!("Bot connected. Setting up handlers...");
+
+    // ── Start the daily scan scheduler ──
+    scheduler::start_daily_scan(bot.clone(), state.clone())
+        .await
+        .context("Failed to start daily scan scheduler")?;
 
     let handler = dptree::entry()
         // Handle /start command
@@ -83,9 +98,29 @@ async fn main() -> Result<()> {
                 .filter_command::<BotCommands>()
                 .endpoint(commands_handler),
         )
-        // Handle plain text messages (ID lookups)
+        // Handle new chat members joining groups
         .branch(
-            Update::filter_message().endpoint(bot_handler::handle_message),
+            Update::filter_message()
+                .filter(|msg: Message| msg.new_chat_members().is_some())
+                .endpoint(bot_handler::handle_new_chat_members),
+        )
+        // Handle member leaving a group
+        .branch(
+            Update::filter_message()
+                .filter(|msg: Message| msg.left_chat_member().is_some())
+                .endpoint(bot_handler::handle_left_chat_member),
+        )
+        // Passively track users who send messages in groups
+        .branch(
+            Update::filter_message()
+                .filter(bot_handler::is_group_chat)
+                .endpoint(bot_handler::handle_group_message),
+        )
+        // Handle plain text messages (ID lookups) — private chats only
+        .branch(
+            Update::filter_message()
+                .filter(bot_handler::is_private_chat)
+                .endpoint(bot_handler::handle_message),
         )
         // Handle inline queries
         .branch(
