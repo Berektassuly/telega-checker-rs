@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      # Override DATABASE_URL to point to the persistent volume path
+      DATABASE_URL: "sqlite:/app/data/telega_checker.db?mode=rwc"
+    volumes:
+      - bot_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  bot_data:

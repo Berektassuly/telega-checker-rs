@@ -1,0 +1,30 @@
+# Build artifacts
+target/
+
+# Git
+.git/
+.gitignore
+
+# Environment (secrets)
+.env
+
+# Local SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Docker files (no need in build context)
+docker-compose.yml
+docker-compose.yaml
+DEPLOY.md
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS junk
+Thumbs.db
+.DS_Store
