@@ -98,7 +98,7 @@ async fn scan_chat(bot: &Bot, state: &AppState, chat_id: i64) -> Result<()> {
             }
         })
         .buffer_unordered(MAX_CONCURRENT_CHECKS)
-        .filter_map(|opt| async { opt })
+        .filter_map(|opt| async move { opt })
         .collect()
         .await;
 
