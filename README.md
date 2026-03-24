@@ -452,6 +452,16 @@ In any Telegram chat, type:
 
 Results are cached on Telegram's side for 300 seconds (5 minutes) via `cache_time`.
 
+### Group Mention
+
+When the bot is added to a group or supergroup, you can check an ID by mentioning the bot:
+
+```
+@telega_checker_rs_bot 123456789
+```
+
+The bot will reply in the group with the lookup result. Invalid or empty IDs are silently ignored to prevent spam.
+
 ### /start Command
 
 Displays usage instructions and a link to the OSINT article on Telega's interception mechanics.
