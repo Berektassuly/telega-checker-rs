@@ -1,0 +1,614 @@
+__id__ = "telega_checker_ayugram"
+__name__ = "Telega Checker (AyuGram Edition)"
+__description__ = "Telega user detector adapted for AyuGram (via Rust BFF)"
+__author__ = "@Berektassuly"
+__version__ = "1.1.0"
+__icon__ = "telega_me/9"
+__min_version__ = "11.12.0"
+
+import json
+import time
+import requests
+import threading
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import run_on_queue
+from hook_utils import find_class, get_private_field
+from org.telegram.messenger import UserObject, ApplicationLoader
+from org.telegram.ui.ActionBar import Theme
+
+try:
+    from ui.settings import Header, Divider, EditText
+except ImportError:
+    pass
+
+try:
+    from java import dynamic_proxy, jclass
+    from org.telegram.ui.Cells import TextDetailCell
+except Exception:
+    dynamic_proxy = None
+    jclass = None
+    TextDetailCell = None
+
+# Default Rust server configuration
+DEFAULT_API_BASE_URL = "https://tc.berektassuly.com"
+DEFAULT_API_BEARER_TOKEN = ""
+
+# Placeholder tokens that must NOT be sent over the wire
+_PLACEHOLDER_TOKENS = frozenset({"your_secret_api_token_here", ""})
+
+LOOKUP_CACHE_TTL_SECONDS = 6 * 60 * 60
+LOOKUP_CACHE_KEY = "telega_lookup_cache_ayu_v1"
+ALERT_SHOWN_KEY = "telega_checker_shown_ayu_v1"
+
+# Cache / alert-shown eviction limits
+MAX_CACHE_ENTRIES = 2000
+MAX_ALERT_ENTRIES = 2000
+
+STATE_UNKNOWN = 0
+STATE_IS_COMPROMISED = 1
+STATE_IS_CLEAN = 2
+
+# Thread lock for _lookups_inflight set
+_inflight_lock = threading.Lock()
+
+
+def _now_ts():
+    return int(time.time())
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _get_attr(obj, *names):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            try:
+                return value()
+            except Exception:
+                continue
+        return value
+    return None
+
+
+def _user_id(user):
+    return _safe_int(_get_attr(user, "id", "f1643id"), 0)
+
+
+def _user_display_name(user):
+    try:
+        name = UserObject.getUserName(user)
+        if name is not None:
+            name = str(name).strip()
+            if name:
+                return name
+    except Exception:
+        pass
+    try:
+        first = str(_get_attr(user, "first_name", "firstName") or "").strip()
+        last = str(_get_attr(user, "last_name", "lastName") or "").strip()
+        full = (first + " " + last).strip()
+        return full if full else "User"
+    except Exception:
+        return "User"
+
+
+def _is_private_human_user(user):
+    if user is None:
+        return False
+    if _user_id(user) <= 0:
+        return False
+    try:
+        if UserObject.isUserSelf(user) or UserObject.isReplyUser(user):
+            return False
+        if UserObject.isBot(user):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+# --- UI Hook Classes for ProfileActivity ---
+
+class RowsHook(MethodHook):
+    def __init__(self, plg):
+        self.plg = plg
+
+    def before_hooked_method(self, param):
+        try:
+            act = param.thisObject
+            st = self.plg.states.setdefault(act, {"row": -1})
+            st["ins"] = False
+            user = self.plg._profile_user(act)
+            if not _is_private_human_user(user):
+                st["row"] = -1
+                return
+            st["ins"] = True
+        except Exception as exc:
+            self.plg.log(f"[warn] RowsHook.before: {exc}")
+
+    def after_hooked_method(self, param):
+        try:
+            act = param.thisObject
+            st = self.plg.states.get(act)
+            if not st or not st.get("ins"):
+                return
+            pos = self._calc_pos(act)
+            if pos == -1:
+                st["row"] = -1
+                return
+            st["row"] = pos
+            rc = self._get_int(act, "rowCount")
+            if rc != -1:
+                self._set_int(act, "rowCount", rc + 1)
+            self._shift(act, st["row"])
+        except Exception as exc:
+            self.plg.log(f"[warn] RowsHook.after: {exc}")
+
+    def _calc_pos(self, act):
+        for n in ["phoneRow", "usernameRow", "bioRow", "channelInfoRow", "userInfoRow"]:
+            v = self._get_int(act, n)
+            if v != -1:
+                return v + 1
+        return -1
+
+    def _get_int(self, o, n):
+        try:
+            f = o.getClass().getDeclaredField(n)
+            f.setAccessible(True)
+            return f.getInt(o)
+        except Exception:
+            return -1
+
+    def _set_int(self, o, n, v):
+        try:
+            f = o.getClass().getDeclaredField(n)
+            f.setAccessible(True)
+            f.setInt(o, v)
+        except Exception:
+            pass
+
+    def _shift(self, act, thres):
+        try:
+            fields = act.getClass().getDeclaredFields()
+            IntCls = jclass("java.lang.Integer")
+            for f in fields:
+                try:
+                    n = f.getName()
+                    if "Row" not in n and "row" not in n:
+                        continue
+                    if n in ("rowCount",):
+                        continue
+                    ft = f.getType()
+                    if ft != IntCls.TYPE and ft != IntCls:
+                        continue
+                    f.setAccessible(True)
+                    val = f.get(act)
+                    if val is not None and int(val) >= thres and int(val) != -1:
+                        f.setInt(act, int(val) + 1)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+
+class TypeHook(MethodHook):
+    def __init__(self, plg):
+        self.plg = plg
+
+    def before_hooked_method(self, param):
+        try:
+            adp = param.thisObject
+            act = self._get_act(adp)
+            st = self.plg.states.get(act)
+            if st and int(param.args[0]) == st.get("row", -1):
+                param.setResult(jclass("java.lang.Integer")(2)) # 2 is usually TextDetailCell
+        except Exception:
+            pass
+
+    def _get_act(self, adp):
+        try:
+            f = adp.getClass().getDeclaredField("this$0")
+            f.setAccessible(True)
+            return f.get(adp)
+        except Exception:
+            return None
+
+
+class BindHook(MethodHook):
+    def __init__(self, plg):
+        self.plg = plg
+
+    def after_hooked_method(self, param):
+        try:
+            pos = int(param.args[1])
+            adp = param.thisObject
+            act = self._get_act(adp)
+            st = self.plg.states.get(act)
+
+            holder = param.args[0]
+            cell = holder.itemView
+
+            if not st or pos != st.get("row", -1):
+                # Cell is being reused for a non-Telega row — remove stale color tracking
+                if cell is not None:
+                    self.plg._telega_cell_states.pop(id(cell), None)
+                return
+
+            if TextDetailCell is None or not isinstance(cell, TextDetailCell):
+                return
+
+            user = self.plg._profile_user(act)
+            if not user:
+                return
+                
+            user_id = _user_id(user)
+            state = self.plg._cache_get_state(user_id)
+            
+            title = "Telega Status"
+            if state == STATE_IS_COMPROMISED:
+                value = "Compromised (Uses Telega)"
+            elif state == STATE_IS_CLEAN:
+                value = "Clean"
+            else:
+                value = "Checking..."
+
+            cell.setTextAndValue(value, title, True)
+
+            self.plg._remember_telega_cell(cell, state)
+            self.plg._apply_telega_cell_colors(cell)
+
+            if state == STATE_UNKNOWN:
+                self.plg._start_lookup(act, user_id)
+
+        except Exception as exc:
+            self.plg.log(f"[warn] BindHook: {exc}")
+
+    def _get_act(self, adp):
+        try:
+            f = adp.getClass().getDeclaredField("this$0")
+            f.setAccessible(True)
+            return f.get(adp)
+        except Exception:
+            return None
+
+
+class ColorHook(MethodHook):
+    def __init__(self, plg):
+        self.plg = plg
+
+    def after_hooked_method(self, param):
+        try:
+            cell = param.thisObject
+            if id(cell) not in self.plg._telega_cell_states:
+                return
+            self.plg._apply_telega_cell_colors(cell)
+        except Exception:
+            pass
+
+
+class ChatResumeHook(MethodHook):
+    def __init__(self, plg):
+        self.plg = plg
+
+    def after_hooked_method(self, param):
+        try:
+            self.plg._on_chat_resume(param.thisObject)
+        except Exception as exc:
+            self.plg.log(f"[warn] ChatResumeHook: {exc}")
+
+
+# --- Main Plugin Class ---
+
+class TelegaCheckerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self._lookup_cache = {}
+        self._alert_shown = {}
+        self._lookups_inflight = set()
+        self._telega_cell_states = {}
+        self.states = {}
+        
+        # Keep-Alive session for Rust backend
+        self._session = requests.Session()
+
+    def on_plugin_load(self):
+        self._check_ayugram()
+        self._lookup_cache = self._load_json_setting(LOOKUP_CACHE_KEY)
+        self._alert_shown = self._load_json_setting(ALERT_SHOWN_KEY)
+
+        # Prune stale cache entries on startup
+        self._evict_expired_cache()
+
+        # Hook ProfileActivity to inject TextDetailCell
+        profile_activity_cls = find_class("org.telegram.ui.ProfileActivity")
+        if profile_activity_cls:
+            self.hook_all_methods(profile_activity_cls, "updateRowsIds", RowsHook(self))
+
+        adp_cls = find_class("org.telegram.ui.ProfileActivity$ListAdapter")
+        if adp_cls:
+            self.hook_all_methods(adp_cls, "getItemViewType", TypeHook(self))
+            self.hook_all_methods(adp_cls, "onBindViewHolder", BindHook(self))
+
+        if TextDetailCell:
+            self.hook_all_methods(TextDetailCell, "updateColors", ColorHook(self))
+
+        # Hook ChatActivity for startup alerts
+        chat_activity_cls = find_class("org.telegram.ui.ChatActivity")
+        if chat_activity_cls:
+            self.hook_all_methods(chat_activity_cls, "onResume", ChatResumeHook(self))
+
+    def on_plugin_unload(self):
+        with _inflight_lock:
+            self._lookups_inflight.clear()
+        self._telega_cell_states.clear()
+        self.states.clear()
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def create_settings(self):
+        try:
+            return [
+                Header(text="Rust API Server Configuration"),
+                Divider(text="Server credentials (telega-checker-rs)"),
+                EditText(
+                    key="api_base_url",
+                    hint="API URL (must be HTTPS)",
+                    default=DEFAULT_API_BASE_URL,
+                ),
+                Divider(text="⚠️ Keep your token secret. Do not share it."),
+                EditText(
+                    key="api_bearer_token",
+                    hint="Bearer Token",
+                    default=DEFAULT_API_BEARER_TOKEN,
+                ),
+            ]
+        except Exception:
+            return []
+
+    def _check_ayugram(self):
+        try:
+            ctx = ApplicationLoader.applicationContext
+            if ctx and "ayugram" not in ctx.getPackageName().lower():
+                self.log("Warning: This plugin is optimized for AyuGram.")
+        except Exception:
+            pass
+
+    # --- Config Validation ---
+
+    def _validate_config(self):
+        """Validate API configuration. Returns (url, token) or None on failure."""
+        token = self.get_setting("api_bearer_token", DEFAULT_API_BEARER_TOKEN).strip()
+        if token.lower() in _PLACEHOLDER_TOKENS:
+            self.log("ERROR: Bearer token not configured. Open plugin settings and set your API token.")
+            return None
+        url = self.get_setting("api_base_url", DEFAULT_API_BASE_URL).strip().rstrip("/")
+        if not url.startswith("https://"):
+            self.log("ERROR: API URL must use HTTPS to protect your bearer token.")
+            return None
+        return url, token
+
+    # --- JSON Settings ---
+
+    def _load_json_setting(self, key):
+        raw = self.get_setting(key, "{}")
+        try:
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_json_setting(self, key, value):
+        try:
+            self.set_setting(key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        except Exception as exc:
+            self.log(f"Failed to save {key}: {exc}")
+
+    # --- Cache ---
+
+    def _cache_get_state(self, user_id):
+        item = self._lookup_cache.get(str(int(user_id)))
+        if not isinstance(item, dict):
+            return STATE_UNKNOWN
+        checked_at = _safe_int(item.get("checked_at"), 0)
+        if checked_at <= 0 or (_now_ts() - checked_at) > LOOKUP_CACHE_TTL_SECONDS:
+            return STATE_UNKNOWN
+        return STATE_IS_COMPROMISED if item.get("value") else STATE_IS_CLEAN
+
+    def _cache_set(self, user_id, is_compromised):
+        self._lookup_cache[str(int(user_id))] = {"value": bool(is_compromised), "checked_at": _now_ts()}
+        # Evict oldest 25% when cache exceeds limit
+        if len(self._lookup_cache) > MAX_CACHE_ENTRIES:
+            entries = sorted(self._lookup_cache.items(), key=lambda x: x[1].get("checked_at", 0))
+            self._lookup_cache = dict(entries[len(entries) // 4:])
+        self._save_json_setting(LOOKUP_CACHE_KEY, self._lookup_cache)
+
+    def _evict_expired_cache(self):
+        """Remove expired entries on startup to keep persistent storage clean."""
+        now = _now_ts()
+        expired = [k for k, v in self._lookup_cache.items()
+                   if not isinstance(v, dict) or (now - _safe_int(v.get("checked_at"), 0)) > LOOKUP_CACHE_TTL_SECONDS]
+        for k in expired:
+            del self._lookup_cache[k]
+        if expired:
+            self._save_json_setting(LOOKUP_CACHE_KEY, self._lookup_cache)
+
+    # --- Alert Shown ---
+
+    def _alert_was_shown(self, user_id):
+        return bool(self._alert_shown.get(str(int(user_id))))
+
+    def _mark_alert_shown(self, user_id):
+        self._alert_shown[str(int(user_id))] = True
+        # Evict oldest entries when limit exceeded
+        if len(self._alert_shown) > MAX_ALERT_ENTRIES:
+            keys = list(self._alert_shown.keys())
+            for k in keys[:len(keys) // 4]:
+                del self._alert_shown[k]
+        self._save_json_setting(ALERT_SHOWN_KEY, self._alert_shown)
+
+    # --- Profile Helpers ---
+
+    def _profile_user(self, profile_activity):
+        try:
+            user_id = _safe_int(_get_attr(profile_activity, "userId"), 0)
+            if user_id <= 0:
+                user_id = _safe_int(get_private_field(profile_activity, "userId"), 0)
+            if user_id <= 0:
+                return None
+            messages_controller = _get_attr(profile_activity, "getMessagesController")
+            if messages_controller is None:
+                return None
+            return messages_controller.getUser(user_id)
+        except Exception:
+            return None
+
+    def _chat_user(self, chat_activity):
+        user = _get_attr(chat_activity, "getCurrentUser", "currentUser")
+        if user is not None:
+            return user
+        return get_private_field(chat_activity, "currentUser")
+
+    def _remember_telega_cell(self, cell, state):
+        try:
+            self._telega_cell_states[id(cell)] = int(state)
+            if len(self._telega_cell_states) > 256:
+                self._telega_cell_states = dict(list(self._telega_cell_states.items())[-128:])
+        except Exception:
+            pass
+
+    def _apply_telega_cell_colors(self, cell):
+        st = self._telega_cell_states.get(id(cell), STATE_UNKNOWN)
+        try:
+            tv1 = get_private_field(cell, "textView") or _get_attr(cell, "textView")
+            if st == STATE_IS_COMPROMISED:
+                color1 = Theme.getColor(Theme.key_text_RedRegular)
+            elif st == STATE_IS_CLEAN:
+                color1 = Theme.getColor(Theme.key_windowBackgroundWhiteGreenText)
+            else:
+                color1 = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+                
+            if tv1 is not None:
+                tv1.setTextColor(color1)
+                tv1.invalidate()
+        except Exception:
+            pass
+
+    # --- Chat Resume ---
+
+    def _on_chat_resume(self, chat_activity):
+        user = self._chat_user(chat_activity)
+        if not _is_private_human_user(user):
+            return
+
+        user_id = _user_id(user)
+        state = self._cache_get_state(user_id)
+        
+        if state == STATE_IS_COMPROMISED:
+            if not self._alert_was_shown(user_id):
+                self._show_compromised_alert(chat_activity, user_id)
+            return
+        elif state == STATE_IS_CLEAN:
+            return
+
+        self._start_lookup(chat_activity, user_id, is_chat=True)
+
+    # --- Lookup ---
+
+    def _start_lookup(self, activity, user_id, is_chat=False):
+        key = str(int(user_id))
+        with _inflight_lock:
+            if key in self._lookups_inflight:
+                return
+            self._lookups_inflight.add(key)
+
+        def worker():
+            try:
+                is_compromised = self._fetch_from_rust_backend(user_id)
+                if is_compromised is None:
+                    return
+                    
+                self._cache_set(user_id, is_compromised)
+                
+                if is_compromised and is_chat:
+                    run_on_ui_thread(lambda: self._handle_positive_chat_lookup(activity, user_id))
+                elif not is_chat:
+                    run_on_ui_thread(lambda: self._refresh_profile(activity))
+            finally:
+                with _inflight_lock:
+                    self._lookups_inflight.discard(key)
+
+        # Use threading to avoid blocking Telegram's DispatchQueue
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fetch_from_rust_backend(self, user_id):
+        # Validate config before making any network request
+        config = self._validate_config()
+        if config is None:
+            return None
+        api_url, bearer_token = config
+
+        try:
+            headers = {
+                "Authorization": f"Bearer {bearer_token}",
+                "Accept": "application/json"
+            }
+            
+            endpoint = f"{api_url}/api/check/{int(user_id)}"
+            response = self._session.get(endpoint, headers=headers, timeout=(5, 10))
+            
+            if response.status_code == 200:
+                data = response.json()
+                return bool(data.get("is_compromised", False))
+            else:
+                self.log(f"Rust API backend error: HTTP {response.status_code}")
+                return None
+                
+        except requests.exceptions.ConnectionError as exc:
+            self.log(f"Connection error to Rust backend: {exc}")
+            return None
+        except requests.exceptions.Timeout as exc:
+            self.log(f"Timeout connecting to Rust backend: {exc}")
+            return None
+        except requests.exceptions.RequestException as exc:
+            self.log(f"Network error: {exc}")
+            return None
+        except Exception as exc:
+            self.log(f"Unexpected error during lookup for {user_id}: {exc}")
+            return None
+
+    def _refresh_profile(self, profile_activity):
+        try:
+            list_adapter = get_private_field(profile_activity, "listAdapter")
+            if list_adapter is not None:
+                list_adapter.notifyDataSetChanged()
+        except Exception:
+            pass
+
+    def _handle_positive_chat_lookup(self, chat_activity, user_id):
+        if not self._alert_was_shown(user_id):
+            self._show_compromised_alert(chat_activity, user_id)
+
+    def _show_compromised_alert(self, activity_instance, user_id):
+        activity = _get_attr(activity_instance, "getParentActivity")
+        if activity is None:
+            return
+        self._mark_alert_shown(user_id)
+        from ui.alert import AlertDialogBuilder
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Warning")
+        builder.set_message("This user is using Telega. The chat might be compromised.")
+        builder.set_positive_button("OK", lambda bld, _which: bld.dismiss())
+        builder.show()
