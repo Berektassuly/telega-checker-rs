@@ -11,6 +11,7 @@ use teloxide::types::{
 use tracing::{debug, error, info, warn};
 
 use crate::api_client::ApiClient;
+use crate::crypto;
 use crate::db;
 
 /// Shared application state injected into all handlers via `dptree::deps!`.
@@ -28,6 +29,8 @@ pub struct AppState {
     pub tracking_cache: Cache<(i64, i64), ()>,
     /// Telegram user ID of the bot administrator.
     pub admin_id: i64,
+    /// Secret pepper for HMAC-SHA256 pseudonymization of analytics user IDs.
+    pub analytics_salt: String,
 }
 
 // ─── Core lookup logic ──────────────────────────────────────────────────────
@@ -466,10 +469,12 @@ pub async fn handle_message(
         }
     };
 
-    // Log the bot user (fire-and-forget, don't block the response)
+    // Pseudonymize the sender's user ID for analytics
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
-    if let Err(e) = db::log_bot_user(&state.pool, user_id, username).await {
+    let user_hash = crypto::hash_user_id(user_id, &state.analytics_salt);
+
+    // Log the bot user (fire-and-forget, don't block the response)
+    if let Err(e) = db::log_bot_user(&state.pool, &user_hash).await {
         error!("Failed to log bot user: {}", e);
     }
 
@@ -486,8 +491,8 @@ pub async fn handle_message(
         }
     };
 
-    // Log the request
-    if let Err(e) = db::log_request(&state.pool, user_id, telegram_id, result_short).await {
+    // Log the request (pseudonymized)
+    if let Err(e) = db::log_request(&state.pool, &user_hash, telegram_id, result_short).await {
         error!("Failed to log request: {}", e);
     }
 
@@ -517,17 +522,28 @@ pub async fn handle_inline_query(
         }
     };
 
+    // Pseudonymize the sender's user ID for analytics
+    let user_id = q.from.id.0 as i64;
+    let user_hash = crypto::hash_user_id(user_id, &state.analytics_salt);
+
+    // Log the bot user (fire-and-forget)
+    if let Err(e) = db::log_bot_user(&state.pool, &user_hash).await {
+        error!("Failed to log bot user: {}", e);
+    }
+
     // Run the three-tier lookup
-    let (title, description, text) = match check_user(telegram_id, &state).await {
+    let (title, description, text, result_short) = match check_user(telegram_id, &state).await {
         Ok(true) => (
             "✅ ДА",
             format!("ID {} зарегистрирован в Telega", telegram_id),
             format!("✅ ДА — ID {} зарегистрирован в Telega.", telegram_id),
+            "YES",
         ),
         Ok(false) => (
             "❌ НЕТ",
             format!("ID {} не найден в Telega", telegram_id),
             format!("❌ НЕТ — ID {} не найден в Telega.", telegram_id),
+            "NO",
         ),
         Err(e) => {
             error!("Inline lookup error for ID {}: {}", telegram_id, e);
@@ -535,9 +551,15 @@ pub async fn handle_inline_query(
                 "⚠️ Ошибка",
                 format!("Не удалось проверить ID {}", telegram_id),
                 format!("⚠️ Ошибка при проверке ID {}.", telegram_id),
+                "ERROR",
             )
         }
     };
+
+    // Log the request (pseudonymized)
+    if let Err(e) = db::log_request(&state.pool, &user_hash, telegram_id, result_short).await {
+        error!("Failed to log request: {}", e);
+    }
 
     let article = InlineQueryResultArticle::new(
         format!("check_{}", telegram_id),
@@ -585,10 +607,12 @@ pub async fn handle_mention_lookup(
         _ => return Ok(()), // Silently ignore invalid input in groups
     };
 
-    // Log the bot user (fire-and-forget)
+    // Pseudonymize the sender's user ID for analytics
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-    let username = msg.from.as_ref().and_then(|u| u.username.as_deref());
-    if let Err(e) = db::log_bot_user(&state.pool, user_id, username).await {
+    let user_hash = crypto::hash_user_id(user_id, &state.analytics_salt);
+
+    // Log the bot user (fire-and-forget)
+    if let Err(e) = db::log_bot_user(&state.pool, &user_hash).await {
         error!("Failed to log bot user: {}", e);
     }
 
@@ -602,8 +626,8 @@ pub async fn handle_mention_lookup(
         }
     };
 
-    // Log the request
-    if let Err(e) = db::log_request(&state.pool, user_id, telegram_id, result_short).await {
+    // Log the request (pseudonymized)
+    if let Err(e) = db::log_request(&state.pool, &user_hash, telegram_id, result_short).await {
         error!("Failed to log request: {}", e);
     }
 

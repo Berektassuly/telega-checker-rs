@@ -2,6 +2,7 @@ mod api_client;
 mod api_server;
 mod bot_handler;
 mod config;
+mod crypto;
 mod db;
 mod scheduler;
 
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
         api,
         tracking_cache,
         admin_id: cfg.admin_id,
+        analytics_salt: cfg.analytics_salt.clone(),
     };
 
     // ── Setup teloxide bot & dispatcher ──

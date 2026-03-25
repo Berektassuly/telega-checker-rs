@@ -1,4 +1,9 @@
 use anyhow::{Context, Result};
+use tracing::info;
+use uuid::Uuid;
+
+/// Path to the auto-generated analytics pepper file.
+const ANALYTICS_KEY_FILE: &str = ".analytics_key";
 
 /// Application configuration loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -19,6 +24,9 @@ pub struct AppConfig {
     /// Telegram user ID of the bot administrator.
     /// Required for gating admin-only commands like /upload_assets.
     pub admin_id: i64,
+    /// Secret pepper for HMAC-SHA256 pseudonymization of analytics user IDs.
+    /// Auto-generated on first startup and persisted in `.analytics_key`.
+    pub analytics_salt: String,
 }
 
 impl AppConfig {
@@ -49,6 +57,29 @@ impl AppConfig {
                 .context("ADMIN_ID must be set")?
                 .parse()
                 .context("ADMIN_ID must be a valid integer (Telegram user ID)")?,
+            analytics_salt: Self::load_or_generate_salt()
+                .context("Failed to load or generate analytics salt")?,
         })
+    }
+
+    /// Load the analytics pepper from `.analytics_key`, or generate a new one
+    /// using two concatenated UUID v4 values (zero-knowledge approach).
+    fn load_or_generate_salt() -> Result<String> {
+        let path = std::path::Path::new(ANALYTICS_KEY_FILE);
+
+        if path.exists() {
+            let key = std::fs::read_to_string(path)
+                .context("Failed to read .analytics_key")?
+                .trim()
+                .to_string();
+            info!("Analytics salt loaded from {}", ANALYTICS_KEY_FILE);
+            return Ok(key);
+        }
+
+        // Generate a strong key: two UUID v4 concatenated (72 chars of entropy)
+        let key = format!("{}{}", Uuid::new_v4(), Uuid::new_v4());
+        std::fs::write(path, &key).context("Failed to write .analytics_key")?;
+        info!("Generated new analytics salt and saved to {}", ANALYTICS_KEY_FILE);
+        Ok(key)
     }
 }

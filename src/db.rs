@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 use tracing::info;
 use uuid::Uuid;
 
+
 // ─── Schema initialization ─────────────────────────────────────────────────
 
 /// Create all required tables if they don't already exist.
@@ -22,11 +23,10 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Users who have interacted with the bot (for stats & rate-limiting)
+    // Users who have interacted with the bot (pseudonymized analytics)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS bot_users (
-            user_id    INTEGER PRIMARY KEY,
-            username   TEXT,
+            user_hash  TEXT PRIMARY KEY,
             first_seen TEXT NOT NULL DEFAULT (datetime('now')),
             last_seen  TEXT NOT NULL DEFAULT (datetime('now'))
         )"
@@ -34,11 +34,11 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Optional analytics log of every lookup request
+    // Optional analytics log of every lookup request (pseudonymized)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS requests_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id    INTEGER NOT NULL,
+            user_hash  TEXT    NOT NULL,
             queried_id INTEGER NOT NULL,
             result     TEXT    NOT NULL,
             created_at TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -113,21 +113,18 @@ pub async fn save_telega_id(pool: &SqlitePool, telegram_id: i64) -> Result<()> {
 
 // ─── bot_users operations ───────────────────────────────────────────────────
 
-/// Record or update a bot user. On conflict, just refresh `last_seen`.
+/// Record or update a bot user (pseudonymized). On conflict, just refresh `last_seen`.
 pub async fn log_bot_user(
     pool: &SqlitePool,
-    user_id: i64,
-    username: Option<&str>,
+    user_hash: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO bot_users (user_id, username)
-         VALUES (?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-            username  = excluded.username,
+        "INSERT INTO bot_users (user_hash)
+         VALUES (?)
+         ON CONFLICT(user_hash) DO UPDATE SET
             last_seen = datetime('now')"
     )
-    .bind(user_id)
-    .bind(username)
+    .bind(user_hash)
     .execute(pool)
     .await?;
     Ok(())
@@ -135,17 +132,17 @@ pub async fn log_bot_user(
 
 // ─── requests_log operations ────────────────────────────────────────────────
 
-/// Insert a lookup event into the analytics log.
+/// Insert a lookup event into the analytics log (pseudonymized).
 pub async fn log_request(
     pool: &SqlitePool,
-    user_id: i64,
+    user_hash: &str,
     queried_id: i64,
     result: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO requests_log (user_id, queried_id, result) VALUES (?, ?, ?)"
+        "INSERT INTO requests_log (user_hash, queried_id, result) VALUES (?, ?, ?)"
     )
-    .bind(user_id)
+    .bind(user_hash)
     .bind(queried_id)
     .bind(result)
     .execute(pool)

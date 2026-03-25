@@ -49,3 +49,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 # UUID generation for per-user API tokens
 uuid = { version = "1", features = ["v4"] }
+
+# Cryptographic primitives for analytics pseudonymization (HMAC-SHA256)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"

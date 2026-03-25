@@ -2,5 +2,8 @@ target
 .env
 *telega_checker.db*
 
+# Analytics pseudonymization secret (auto-generated, zero-knowledge)
+.analytics_key
+
 # Cloudflare Origin Certificate (private key must NEVER be committed)
 nginx/ssl/
