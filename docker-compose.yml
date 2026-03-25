@@ -16,38 +16,21 @@ services:
     networks:
       - internal
 
-  # ── Nginx Reverse Proxy (SSL termination + rate limiting) ──
+  # ── Nginx Reverse Proxy (rate limiting, Cloudflare handles SSL) ──
   nginx:
     image: nginx:alpine
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - certbot_conf:/etc/letsencrypt:ro
-      - certbot_www:/var/www/certbot:ro
     depends_on:
       - bot
     restart: unless-stopped
     networks:
       - internal
 
-  # ── Certbot (Let's Encrypt SSL certificate management) ──
-  certbot:
-    image: certbot/certbot
-    volumes:
-      - certbot_conf:/etc/letsencrypt
-      - certbot_www:/var/www/certbot
-    # Run dry-run by default; override with actual domain for production:
-    #   docker compose run certbot certonly --webroot -w /var/www/certbot -d yourdomain.com
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
-    networks:
-      - internal
-
 volumes:
   bot_data:
-  certbot_conf:
-  certbot_www:
 
 networks:
   internal:
