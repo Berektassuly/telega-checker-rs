@@ -9,22 +9,20 @@ services:
     volumes:
       - bot_data:/app/data
     # No port mapping to host — only exposed to the internal Docker network.
-    # Nginx proxies external traffic to bot:8080.
+    # Cloudflare Tunnel proxies external traffic to bot:8080.
     expose:
       - "8080"
     restart: unless-stopped
     networks:
       - internal
 
-  # ── Nginx Reverse Proxy (SSL via Cloudflare Origin Cert + rate limiting) ──
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
+  # ── Cloudflare Tunnel (Secure outbound connection to Cloudflare) ──
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    # Run the tunnel using the token provided in .env
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
       - bot
     restart: unless-stopped
