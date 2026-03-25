@@ -47,6 +47,9 @@ WORKDIR /app
 # Copy compiled binary from builder
 COPY --from=builder /build/target/release/telega-checker-rs ./
 
+# Copy plugin files for /upload_assets command
+COPY plugins/ plugins/
+
 # Drop to non-root
 USER appuser
 
