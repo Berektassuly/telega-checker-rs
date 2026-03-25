@@ -1,3 +1,6 @@
 target
 .env
 *telega_checker.db*
+
+# Cloudflare Origin Certificate (private key must NEVER be committed)
+nginx/ssl/

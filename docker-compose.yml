@@ -16,13 +16,15 @@ services:
     networks:
       - internal
 
-  # ── Nginx Reverse Proxy (rate limiting, Cloudflare handles SSL) ──
+  # ── Nginx Reverse Proxy (SSL via Cloudflare Origin Cert + rate limiting) ──
   nginx:
     image: nginx:alpine
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - bot
     restart: unless-stopped
