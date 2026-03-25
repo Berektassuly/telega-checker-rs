@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
 
     // ── Initialize SQLite connection pool ──
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(cfg.db_max_connections)
         .connect(&cfg.database_url)
         .await
         .context("Failed to connect to SQLite database")?;
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     info!("Bot connected. Setting up handlers...");
 
     // ── Start the daily scan scheduler ──
-    scheduler::start_daily_scan(bot.clone(), state.clone())
+    let scheduler_handle = scheduler::start_daily_scan(bot.clone(), state.clone())
         .await
         .context("Failed to start daily scan scheduler")?;
 
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
         .error_handler(LoggingErrorHandler::with_custom_text(
             "Error in the dispatcher",
         ))
-        .enable_ctrlc_handler()
+
         .build();
 
     // ── Run both cores concurrently ──
@@ -198,6 +198,15 @@ async fn main() -> Result<()> {
         () = dispatcher.dispatch() => {
             info!("Telegram bot dispatcher exited");
         }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, initiating graceful shutdown...");
+        }
+    }
+
+    // Gracefully shut down the daily scan scheduler
+    info!("Shutting down scheduler...");
+    if let Err(e) = scheduler_handle.shutdown().await {
+        error!("Failed to shut down scheduler: {}", e);
     }
 
     info!("TelegaChecker stopped.");

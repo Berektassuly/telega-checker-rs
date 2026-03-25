@@ -13,6 +13,9 @@ pub struct AppConfig {
     pub api_bearer_token: String,
     /// Port for the HTTP API server (default: 8080).
     pub api_port: u16,
+    /// Maximum SQLite connection pool size (default: 5).
+    /// Increase for deployments with many concurrent group scans.
+    pub db_max_connections: u32,
 }
 
 impl AppConfig {
@@ -35,6 +38,10 @@ impl AppConfig {
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
                 .context("API_PORT must be a valid port number")?,
+            db_max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()
+                .context("DATABASE_MAX_CONNECTIONS must be a valid u32")?,
         })
     }
 }

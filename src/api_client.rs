@@ -1,8 +1,15 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Maximum number of retries when rate-limited (HTTP 429).
+const MAX_RETRIES: u32 = 4;
+/// Base delay for exponential backoff (doubles each retry: 1s → 2s → 4s → 8s).
+const BASE_DELAY_MS: u64 = 1000;
 
 /// Distinguishes auth failures (worth retrying with a fresh session)
 /// from other API errors (should be propagated as-is).
@@ -10,6 +17,8 @@ use tracing::{debug, info, warn};
 enum LookupError {
     /// 401/403 — session likely expired, retry after refresh.
     Auth(anyhow::Error),
+    /// 429 — rate limited, should back off and retry.
+    RateLimited,
     /// Any other failure — do NOT refresh session.
     Other(anyhow::Error),
 }
@@ -126,14 +135,48 @@ impl ApiClient {
 
     /// Check if a Telegram ID exists in the Telega call infrastructure.
     ///
-    /// Implements **retry-on-expired-session** with double-checked locking:
+    /// Wraps [`try_lookup_with_auth`] with an **exponential backoff** retry
+    /// loop for HTTP 429 (rate-limited) responses. Retries up to
+    /// `MAX_RETRIES` times with delays of 1s → 2s → 4s → 8s.
+    pub async fn check_id(&self, telegram_id: i64) -> Result<bool> {
+        for attempt in 0..=MAX_RETRIES {
+            match self.try_lookup_with_auth(telegram_id).await {
+                Ok(found) => return Ok(found),
+                Err(LookupError::RateLimited) if attempt < MAX_RETRIES => {
+                    let delay = Duration::from_millis(BASE_DELAY_MS * 2u64.pow(attempt));
+                    warn!(
+                        telegram_id,
+                        attempt = attempt + 1,
+                        max_retries = MAX_RETRIES,
+                        delay_ms = delay.as_millis() as u64,
+                        "Rate limited (HTTP 429), backing off..."
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(LookupError::RateLimited) => {
+                    return Err(anyhow!(
+                        "Rate limited (HTTP 429) for ID {} after {} retries",
+                        telegram_id,
+                        MAX_RETRIES
+                    ));
+                }
+                Err(LookupError::Auth(e) | LookupError::Other(e)) => return Err(e),
+            }
+        }
+
+        // Unreachable: the loop always returns, but satisfy the compiler
+        unreachable!()
+    }
+
+    /// Attempt a lookup with automatic session refresh on auth failure.
+    ///
     /// 1. Snapshot the current session key.
     /// 2. Attempt the lookup.
-    /// 3. On failure, call `refresh_session(old_key)` which only hits the
-    ///    auth API if no other task has already refreshed the key.
-    /// 4. Retry exactly once with the fresh key.
-    pub async fn check_id(&self, telegram_id: i64) -> Result<bool> {
-        // Snapshot the current key before the attempt
+    /// 3. On 401/403, call `refresh_session` (double-checked) and retry once.
+    async fn try_lookup_with_auth(
+        &self,
+        telegram_id: i64,
+    ) -> std::result::Result<bool, LookupError> {
         let old_key = self.session_key.read().await.clone();
 
         match self.try_lookup(telegram_id).await {
@@ -143,22 +186,16 @@ impl ApiClient {
                     "Lookup failed (expired session): {}. Refreshing session_key...",
                     e
                 );
-                // Refresh only if nobody else already did
-                self.refresh_session(old_key).await.context(
-                    "Failed to re-authenticate after expired session",
-                )?;
-                // Retry exactly once with the fresh key
-                self.try_lookup(telegram_id)
+                self.refresh_session(old_key)
                     .await
-                    .map_err(|e| match e {
-                        LookupError::Auth(e) | LookupError::Other(e) => e,
-                    })
-                    .context("Lookup failed even after session refresh")
+                    .map_err(|e| LookupError::Other(e.context(
+                        "Failed to re-authenticate after expired session",
+                    )))?;
+                // Retry exactly once with the fresh key
+                self.try_lookup(telegram_id).await
             }
-            Err(LookupError::Other(e)) => {
-                // Non-auth error (5xx, 429, network) — don't touch the session
-                Err(e.context("Lookup API error (not auth-related)"))
-            }
+            // Propagate RateLimited and Other as-is
+            Err(e) => Err(e),
         }
     }
 
@@ -262,6 +299,12 @@ impl ApiClient {
             .map_err(|e| LookupError::Other(anyhow::Error::from(e).context("Failed to read lookup response body")))?;
 
         if !status.is_success() {
+            // Rate limit — signal the caller to back off and retry
+            if status.as_u16() == 429 {
+                warn!("Received HTTP 429 (Too Many Requests) from API");
+                return Err(LookupError::RateLimited);
+            }
+
             let err = anyhow!("Lookup API returned status {}: {}", status, body);
             // Only treat 401/403 as auth errors worth retrying
             return if status.as_u16() == 401 || status.as_u16() == 403 {

@@ -16,7 +16,10 @@ const MAX_CONCURRENT_CHECKS: usize = 10;
 
 /// Start the daily scan scheduler. Spawns a background task that runs
 /// the Telega scan at 09:00 UTC every day.
-pub async fn start_daily_scan(bot: Bot, state: AppState) -> Result<()> {
+///
+/// Returns the `JobScheduler` handle so the caller can shut it down
+/// gracefully when the application exits.
+pub async fn start_daily_scan(bot: Bot, state: AppState) -> Result<JobScheduler> {
     let sched = JobScheduler::new()
         .await
         .context("Failed to create job scheduler")?;
@@ -47,12 +50,8 @@ pub async fn start_daily_scan(bot: Bot, state: AppState) -> Result<()> {
         .await
         .context("Failed to start job scheduler")?;
 
-    // Deliberately leak the scheduler handle — it runs for the entire
-    // lifetime of the application. Dropping it would stop the scheduler.
-    std::mem::forget(sched);
-
     info!("Daily scan scheduler started (09:00 UTC)");
-    Ok(())
+    Ok(sched)
 }
 
 /// Execute the full scan: iterate over all active chats, check each

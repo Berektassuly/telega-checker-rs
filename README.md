@@ -94,13 +94,13 @@ application_key=<APPLICATION_KEY>&session_key=<SESSION_KEY>&externalIds=[{"id":"
 Returns on match: `{"ids": [{"ok_user_id": <int>, "external_user_id": {"id": "<TELEGRAM_ID>", "ok_anonym": false}}]}`
 Returns on no match: `{"error_code": 4, ...}` or `{"ids": []}`
 
-The session key expires periodically. The implementation handles this transparently via retry-on-401/403 with double-checked locking to prevent redundant re-authentication under concurrency.
+The session key expires periodically. The implementation handles this transparently via retry-on-401/403 with double-checked locking to prevent redundant re-authentication under concurrency. API rate limits (HTTP 429) are handled via exponential backoff (up to 4 retries: 1s → 2s → 4s → 8s).
 
 ---
 
 ## Architecture
 
-The application implements a **Dual-Core** design: a Telegram bot (teloxide) and an HTTP API server (axum) run concurrently on the same tokio runtime via `tokio::select!`, sharing a single `AppState`. This ensures that a cache hit from the bot instantly benefits the API, and vice versa. Both cores feed into a three-tier lookup with distinct latency and persistence characteristics at each level. The bot additionally operates as a passive group monitor with a daily scheduled scanner.
+The application implements a **Dual-Core** design: a Telegram bot (teloxide) and an HTTP API server (axum) run concurrently on the same tokio runtime via `tokio::select!`, sharing a single `AppState`. This ensures that a cache hit from the bot instantly benefits the API, and vice versa. Both cores feed into a three-tier lookup with distinct latency and persistence characteristics at each level. The bot additionally operates as a passive group monitor with a daily scheduled scanner. A dedicated `tokio::signal::ctrl_c()` branch ensures graceful shutdown of all subsystems — the HTTP server, the Telegram dispatcher, and the daily scan scheduler — on SIGTERM or Ctrl+C.
 
 ### Network Topology
 
@@ -141,13 +141,14 @@ When added to a group, the bot silently tracks members through three event sourc
 
 ### Daily Scan
 
-A `tokio-cron-scheduler` job runs at **09:00 UTC** daily:
+A `tokio-cron-scheduler` job runs at **09:00 UTC** daily. The scheduler handle is retained by `main.rs` and shut down gracefully on application exit (no resource leaks):
 
 1. Fetches all distinct `chat_id` values with active members from `chat_members`.
 2. For each chat, checks all active `user_id` values through the three-tier lookup.
 3. Limits concurrent API checks to 10 via `futures::stream::buffer_unordered`.
-4. Sends an aggregated HTML report to chats with positive hits. Silent if no hits.
-5. **Self-cleaning**: if sending fails with `BotKicked` / `ChatNotFound` / similar errors, all members for that chat are soft-deleted to prevent wasted resources in future scans.
+4. API rate limits (HTTP 429) are absorbed transparently via exponential backoff — individual lookups retry up to 4 times (1s → 2s → 4s → 8s) without blocking the tokio runtime.
+5. Sends an aggregated HTML report to chats with positive hits. Silent if no hits.
+6. **Self-cleaning**: if sending fails with `BotKicked` / `ChatNotFound` / similar errors, all members for that chat are soft-deleted to prevent wasted resources in future scans.
 
 ### Three-Tier Lookup
 
@@ -194,6 +195,10 @@ Telegram Update (Message | InlineQuery)
 ### Session Management
 
 The `ApiClient` stores the session key behind a `tokio::sync::RwLock<Option<String>>`. Many handlers read concurrently (`RwLock::read`); on 401/403, `refresh_session` acquires a write lock and performs double-checked locking: if another task already refreshed the key while the current task was waiting for the lock, the refresh is a no-op. This prevents N concurrent failures from triggering N authentication requests.
+
+### API Rate Limit Handling
+
+HTTP 429 responses from `calls.okcdn.ru` are handled via **exponential backoff**. When the API returns 429 (Too Many Requests), the client retries up to 4 times with increasing delays: 1s → 2s → 4s → 8s. The backoff uses `tokio::time::sleep` (non-blocking — does not stall the tokio runtime). If all retries are exhausted, the error propagates to the caller. This is critical for the daily scan, where hundreds of concurrent lookups may trigger rate limiting.
 
 ---
 
@@ -284,6 +289,8 @@ flowchart TD
         AUTH_CHECK -- "Yes" --> API_CALL["POST /api/vchat/<br/>getOkIdsByExternalIds"]
         API_CALL --> API_STATUS{"HTTP status?"}
         API_STATUS -- "401/403" --> REFRESH
+        API_STATUS -- "429" --> BACKOFF["Exponential Backoff<br/>1s → 2s → 4s → 8s<br/>(up to 4 retries)"]
+        BACKOFF --> API_CALL
         API_STATUS -- "2xx" --> PARSE["Parse LookupResponse<br/>Match external_user_id.id"]
         API_STATUS -- "Other error" --> PROPAGATE["LookupError::Other<br/>→ bubble up"]
 
@@ -381,12 +388,12 @@ telega-checker-rs/
 │   ├── README_RU.md        # Russian version of README
 │   └── DEPLOY.md           # Extended deployment instructions
 └── src/
-    ├── main.rs             # Dual-Core entrypoint: tokio::select!(Axum, Teloxide)
-    ├── config.rs           # AppConfig: env var loading (bot token, API token, port, etc.)
+    ├── main.rs             # Dual-Core entrypoint: tokio::select!(Axum, Teloxide, Ctrl+C) with graceful shutdown
+    ├── config.rs           # AppConfig: env var loading (bot token, API token, port, DB pool size, etc.)
     ├── api_server.rs       # Axum HTTP API: Bearer auth, GET /api/check/:telegram_id
-    ├── api_client.rs       # ApiClient: calls.okcdn.ru auth + lookup with session refresh
+    ├── api_client.rs       # ApiClient: calls.okcdn.ru auth + lookup with session refresh + 429 exponential backoff
     ├── bot_handler.rs      # Telegram handlers: /start, message, inline, group tracking; three-tier lookup
-    ├── scheduler.rs        # Daily cron scan: iterates active chats, checks members, sends reports
+    ├── scheduler.rs        # Daily cron scan: returns handle for graceful shutdown; iterates chats, checks members
     └── db.rs               # SQLite schema init, known_users + chat_members CRUD, analytics logging
 ```
 
@@ -419,6 +426,7 @@ cp .env.example .env
 | `APPLICATION_KEY` | No | `CHKIPMKGDIHBABABA` | OK.ru API application key for `calls.okcdn.ru` authentication |
 | `API_BEARER_TOKEN` | Yes | -- | Bearer token for authenticating HTTP API requests (used by Android plugin) |
 | `API_PORT` | No | `8080` | Port for the Axum HTTP API server |
+| `DATABASE_MAX_CONNECTIONS` | No | `5` | Maximum SQLite connection pool size. Increase for deployments with many concurrent group scans. |
 | `RUST_LOG` | No | `info` | Tracing filter directive. Set to `debug` for verbose output, `warn` for production. |
 
 ---
