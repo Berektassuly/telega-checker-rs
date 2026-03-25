@@ -354,7 +354,7 @@ async fn send_plugins_and_token(
 <code>{token}</code>
 
 4. Укажите endpoint API:
-<code>https://telega.berektassuly.me/api/check/</code>
+<code>https://tc.berektassuly.com/api/check/</code>
 
 <b>Важно:</b>
 • Токен привязан к вашему Telegram аккаунту.

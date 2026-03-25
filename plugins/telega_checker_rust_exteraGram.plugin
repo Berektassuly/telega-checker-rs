@@ -188,8 +188,19 @@ class TelegaCheckerPlugin(BasePlugin):
         self._badge_resolve_inflight = False
         self._click_listeners = {}
         
-        # Keep-Alive session for Rust backend
+        # Keep-Alive session for Rust backend with connection pool tuning
         self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=4,
+            max_retries=requests.adapters.Retry(
+                total=2,
+                backoff_factor=0.5,
+                status_forcelist=[502, 503, 504],
+                allowed_methods=["GET"],
+            ),
+        )
+        self._session.mount("https://", adapter)
 
     def on_plugin_load(self):
         if BadgeDTO is None:

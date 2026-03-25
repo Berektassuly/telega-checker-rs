@@ -318,8 +318,19 @@ class TelegaCheckerPlugin(BasePlugin):
         self._telega_cell_states = {}
         self.states = {}
         
-        # Keep-Alive session for Rust backend
+        # Keep-Alive session for Rust backend with connection pool tuning
         self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=4,
+            max_retries=requests.adapters.Retry(
+                total=2,
+                backoff_factor=0.5,
+                status_forcelist=[502, 503, 504],
+                allowed_methods=["GET"],
+            ),
+        )
+        self._session.mount("https://", adapter)
 
     def on_plugin_load(self):
         self._check_ayugram()
@@ -549,8 +560,9 @@ class TelegaCheckerPlugin(BasePlugin):
                 with _inflight_lock:
                     self._lookups_inflight.discard(key)
 
-        # Use threading to avoid blocking Telegram's DispatchQueue
-        threading.Thread(target=worker, daemon=True).start()
+        # Use run_on_queue to avoid blocking Telegram's UI and leverage
+        # the client's managed thread pool instead of raw daemon threads
+        run_on_queue(worker)
 
     def _fetch_from_rust_backend(self, user_id):
         # Validate config before making any network request
