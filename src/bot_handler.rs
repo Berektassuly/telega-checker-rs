@@ -187,7 +187,7 @@ pub async fn handle_upload_assets(
             Ok(sent_msg) => {
                 // Extract the file_id from the sent document
                 if let Some(doc) = sent_msg.document() {
-                    let file_id = &doc.file.id;
+                    let file_id = &doc.file.id.0;
                     if let Err(e) =
                         db::upsert_plugin_asset(&state.pool, &asset_name, file_id).await
                     {
@@ -236,7 +236,7 @@ pub async fn handle_callback_query(
     match data {
         "get_plugins" => {
             // Answer the callback to remove the loading spinner
-            bot.answer_callback_query(&q.id).await?;
+            bot.answer_callback_query(q.id.clone()).await?;
 
             // Use the chat from the original message
             if let Some(msg) = q.message {
@@ -250,7 +250,7 @@ pub async fn handle_callback_query(
             // Rotate the token
             match db::rotate_token(&state.pool, user_id).await {
                 Ok(new_token) => {
-                    bot.answer_callback_query(&q.id)
+                    bot.answer_callback_query(q.id.clone())
                         .text("Токен обновлён!")
                         .await?;
 
@@ -276,7 +276,7 @@ pub async fn handle_callback_query(
                 }
                 Err(e) => {
                     error!(user_id, "Failed to rotate token: {}", e);
-                    bot.answer_callback_query(&q.id)
+                    bot.answer_callback_query(q.id.clone())
                         .text("Ошибка при обновлении токена")
                         .await?;
                 }
@@ -284,7 +284,7 @@ pub async fn handle_callback_query(
         }
         _ => {
             debug!(data, "Unknown callback query data");
-            bot.answer_callback_query(&q.id).await?;
+            bot.answer_callback_query(q.id.clone()).await?;
         }
     }
 
@@ -335,7 +335,7 @@ async fn send_plugins_and_token(
     // Send each plugin asset as a document using cached file_id (zero bandwidth)
     for (name, file_id) in &assets {
         if let Err(e) = bot
-            .send_document(chat_id, InputFile::file_id(file_id))
+            .send_document(chat_id, InputFile::file_id(teloxide::types::FileId(file_id.clone())))
             .await
         {
             error!(name, "Failed to send plugin asset: {}", e);
