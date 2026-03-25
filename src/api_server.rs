@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::bot_handler::{check_user, AppState};
+use crate::db;
 
 // ─── API response types ─────────────────────────────────────────────────────
 
@@ -40,8 +41,15 @@ pub struct ApiState {
 // ─── Bearer token validation ────────────────────────────────────────────────
 
 /// Extract and validate the `Authorization: Bearer <TOKEN>` header.
-/// Returns `401 Unauthorized` if the header is missing or doesn't match.
-fn validate_bearer(headers: &HeaderMap, expected_token: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+/// Checks against:
+///   1. The static `API_BEARER_TOKEN` (backward compatibility)
+///   2. Per-user tokens from the `api_tokens` table
+/// Returns `401 Unauthorized` if neither matches.
+async fn validate_bearer(
+    headers: &HeaderMap,
+    expected_token: &str,
+    app_state: &AppState,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -64,17 +72,28 @@ fn validate_bearer(headers: &HeaderMap, expected_token: &str) -> Result<(), (Sta
         )
     })?;
 
-    if token != expected_token {
-        warn!("API request rejected: invalid bearer token");
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "Invalid bearer token".to_string(),
-            }),
-        ));
+    // Check 1: Static bearer token (backward compatibility)
+    if token == expected_token {
+        return Ok(());
     }
 
-    Ok(())
+    // Check 2: Per-user token from api_tokens table
+    match db::validate_user_token(&app_state.pool, token).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            error!("Failed to validate user token: {}", e);
+            // Fall through to rejection — don't expose DB errors
+        }
+    }
+
+    warn!("API request rejected: invalid bearer token");
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "Invalid bearer token".to_string(),
+        }),
+    ))
 }
 
 // ─── Endpoint handlers ──────────────────────────────────────────────────────
@@ -89,7 +108,7 @@ async fn handle_check(
     Path(telegram_id_str): Path<String>,
 ) -> impl IntoResponse {
     // ── Authenticate ──
-    validate_bearer(&headers, &api_state.bearer_token)?;
+    validate_bearer(&headers, &api_state.bearer_token, &api_state.app_state).await?;
 
     // ── Parse the telegram_id ──
     let telegram_id: i64 = match telegram_id_str.parse() {

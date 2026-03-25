@@ -16,6 +16,9 @@ pub struct AppConfig {
     /// Maximum SQLite connection pool size (default: 5).
     /// Increase for deployments with many concurrent group scans.
     pub db_max_connections: u32,
+    /// Telegram user ID of the bot administrator.
+    /// Required for gating admin-only commands like /upload_assets.
+    pub admin_id: i64,
 }
 
 impl AppConfig {
@@ -42,6 +45,10 @@ impl AppConfig {
                 .unwrap_or_else(|_| "5".to_string())
                 .parse()
                 .context("DATABASE_MAX_CONNECTIONS must be a valid u32")?,
+            admin_id: std::env::var("ADMIN_ID")
+                .context("ADMIN_ID must be set")?
+                .parse()
+                .context("ADMIN_ID must be a valid integer (Telegram user ID)")?,
         })
     }
 }

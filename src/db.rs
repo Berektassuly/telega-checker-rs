@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
 use tracing::info;
+use uuid::Uuid;
 
 // ─── Schema initialization ─────────────────────────────────────────────────
 
@@ -53,6 +54,29 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             user_id   INTEGER NOT NULL,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
             PRIMARY KEY (chat_id, user_id)
+        )"
+    )
+    .execute(pool)
+    .await?;
+
+    // Per-user API tokens for authenticated HTTP API access
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS api_tokens (
+            user_id    INTEGER PRIMARY KEY,
+            api_token  TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"
+    )
+    .execute(pool)
+    .await?;
+
+    // Persistent file_id storage for plugin assets
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS plugin_assets (
+            name       TEXT PRIMARY KEY,
+            file_id    TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"
     )
     .execute(pool)
@@ -184,6 +208,88 @@ pub async fn get_active_members(pool: &SqlitePool, chat_id: i64) -> Result<Vec<i
         "SELECT user_id FROM chat_members WHERE chat_id = ? AND is_active = TRUE"
     )
     .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// ─── api_tokens operations ──────────────────────────────────────────────────
+
+/// Get or create a per-user API token. Uses INSERT OR IGNORE so the first
+/// call generates a UUID v4, subsequent calls return the existing token.
+pub async fn get_or_create_token(pool: &SqlitePool, user_id: i64) -> Result<String> {
+    let new_token = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO api_tokens (user_id, api_token) VALUES (?, ?)"
+    )
+    .bind(user_id)
+    .bind(&new_token)
+    .execute(pool)
+    .await?;
+
+    let token = sqlx::query_scalar::<_, String>(
+        "SELECT api_token FROM api_tokens WHERE user_id = ?"
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(token)
+}
+
+/// Rotate (replace) a user's API token with a fresh UUID v4.
+/// Returns the newly generated token.
+pub async fn rotate_token(pool: &SqlitePool, user_id: i64) -> Result<String> {
+    let new_token = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "UPDATE api_tokens SET api_token = ?, updated_at = datetime('now') WHERE user_id = ?"
+    )
+    .bind(&new_token)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(new_token)
+}
+
+/// Validate a token from the api_tokens table. Returns true if the token exists.
+pub async fn validate_user_token(pool: &SqlitePool, token: &str) -> Result<bool> {
+    let row = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM api_tokens WHERE api_token = ? LIMIT 1"
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
+// ─── plugin_assets operations ───────────────────────────────────────────────
+
+/// Upsert a plugin asset's file_id. Uses ON CONFLICT to always store
+/// the latest file_id for a given asset name.
+pub async fn upsert_plugin_asset(pool: &SqlitePool, name: &str, file_id: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO plugin_assets (name, file_id)
+         VALUES (?, ?)
+         ON CONFLICT(name) DO UPDATE SET
+            file_id    = excluded.file_id,
+            updated_at = datetime('now')"
+    )
+    .bind(name)
+    .bind(file_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Retrieve all stored plugin assets as (name, file_id) pairs.
+pub async fn get_plugin_assets(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT name, file_id FROM plugin_assets ORDER BY name"
+    )
     .fetch_all(pool)
     .await?;
     Ok(rows)

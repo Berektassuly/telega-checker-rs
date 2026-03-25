@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use moka::future::Cache;
 use sqlx::sqlite::SqlitePoolOptions;
 use teloxide::prelude::*;
+use teloxide::types::UserId;
 use tracing::{error, info};
 
 use bot_handler::AppState;
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
         cache,
         api,
         tracking_cache,
+        admin_id: cfg.admin_id,
     };
 
     // ── Setup teloxide bot & dispatcher ──
@@ -94,6 +96,9 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to start daily scan scheduler")?;
 
+    // ── Admin user ID for dispatcher-level filtering ──
+    let admin_user_id = UserId(cfg.admin_id as u64);
+
     let handler = dptree::entry()
         // ── All message-based handlers under a single filter_message ──
         .branch(
@@ -103,6 +108,18 @@ async fn main() -> Result<()> {
                     dptree::entry()
                         .filter_command::<BotCommands>()
                         .endpoint(commands_handler),
+                )
+                // /upload_assets — admin only (filtered at dispatcher level)
+                .branch(
+                    dptree::entry()
+                        .filter_command::<AdminCommands>()
+                        .filter(move |msg: Message| {
+                            msg.from
+                                .as_ref()
+                                .map(|u| u.id == admin_user_id)
+                                .unwrap_or(false)
+                        })
+                        .endpoint(admin_commands_handler),
                 )
                 // New chat members joining groups
                 .branch(
@@ -163,6 +180,10 @@ async fn main() -> Result<()> {
                     .endpoint(bot_handler::handle_message),
                 ),
         )
+        // ── Callback queries (inline button presses) ──
+        .branch(
+            Update::filter_callback_query().endpoint(bot_handler::handle_callback_query),
+        )
         // ── Inline queries ──
         .branch(
             Update::filter_inline_query().endpoint(bot_handler::handle_inline_query),
@@ -220,15 +241,38 @@ async fn main() -> Result<()> {
 enum BotCommands {
     /// Start the bot / show help
     Start,
+    /// Download plugins and get API key
+    Plugins,
 }
 
-/// Route commands to their respective handlers.
+#[derive(teloxide::macros::BotCommands, Clone)]
+#[command(rename_rule = "snake_case")]
+enum AdminCommands {
+    /// Upload plugin assets (admin only)
+    UploadAssets,
+}
+
+/// Route user commands to their respective handlers.
 async fn commands_handler(
     bot: Bot,
     msg: Message,
     cmd: BotCommands,
+    state: AppState,
 ) -> Result<(), teloxide::RequestError> {
     match cmd {
         BotCommands::Start => bot_handler::handle_start(bot, msg).await,
+        BotCommands::Plugins => bot_handler::handle_plugins(bot, msg, state).await,
+    }
+}
+
+/// Route admin commands to their respective handlers.
+async fn admin_commands_handler(
+    bot: Bot,
+    msg: Message,
+    cmd: AdminCommands,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    match cmd {
+        AdminCommands::UploadAssets => bot_handler::handle_upload_assets(bot, msg, state).await,
     }
 }

@@ -46,3 +46,6 @@ futures = "0.3"
 # HTTP API server (Axum) for the BFF / Android plugin endpoint
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# UUID generation for per-user API tokens
+uuid = { version = "1", features = ["v4"] }

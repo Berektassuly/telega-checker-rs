@@ -5,10 +5,10 @@ use moka::future::Cache;
 use sqlx::SqlitePool;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatKind, InlineQueryResult, InlineQueryResultArticle, InputMessageContent,
-    InputMessageContentText, Me,
+    ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResult,
+    InlineQueryResultArticle, InputFile, InputMessageContent, InputMessageContentText, Me,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::api_client::ApiClient;
 use crate::db;
@@ -26,6 +26,8 @@ pub struct AppState {
     /// Maps (chat_id, user_id) → () with a short TTL (~5 min) to avoid
     /// hitting the database on every single message in active chats.
     pub tracking_cache: Cache<(i64, i64), ()>,
+    /// Telegram user ID of the bot administrator.
+    pub admin_id: i64,
 }
 
 // ─── Core lookup logic ──────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ pub async fn check_user(telegram_id: i64, state: &AppState) -> Result<bool> {
 
 // ─── /start command handler ─────────────────────────────────────────────────
 
-/// Handle the /start command with a greeting message.
+/// Handle the /start command with a greeting message and plugin download button.
 pub async fn handle_start(bot: Bot, msg: Message) -> Result<(), teloxide::RequestError> {
     let greeting = r#"Добро пожаловать в TelegaChecker!
 
@@ -85,10 +87,294 @@ Telega Checker специализированный инструмент для 
 Связь с разработчиком:
 По вопросам сотрудничества, баг-репортам или предложениям обращайтесь: @Berektassuly"#;
 
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "Скачать плагины и получить API ключ",
+        "get_plugins",
+    )]]);
+
     bot.send_message(msg.chat.id, greeting)
         .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(keyboard)
         .await?;
 
+    Ok(())
+}
+
+// ─── /plugins command handler (private chats only) ─────────────────────────
+
+/// Handle the /plugins command: deliver plugin assets + API token.
+pub async fn handle_plugins(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    // Only work in private chats
+    if !is_private_chat(&msg) {
+        bot.send_message(msg.chat.id, "Эта команда доступна только в личных сообщениях.")
+            .await?;
+        return Ok(());
+    }
+
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+    if user_id == 0 {
+        return Ok(());
+    }
+
+    send_plugins_and_token(&bot, msg.chat.id, user_id, &state).await
+}
+
+// ─── /upload_assets command handler (admin only) ────────────────────────────
+
+/// Handle the /upload_assets command: upload plugin files to Telegram and
+/// store their file_ids in the database. Admin-only.
+pub async fn handle_upload_assets(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+
+    // Admin guard (defense-in-depth — dispatcher also filters)
+    if user_id != state.admin_id {
+        warn!(user_id, "Unauthorized /upload_assets attempt");
+        return Ok(());
+    }
+
+    bot.send_message(msg.chat.id, "Загрузка плагинов из директории plugins/...")
+        .await?;
+
+    // Read .plugin files from the plugins/ directory
+    let plugin_dir = std::path::Path::new("plugins");
+    if !plugin_dir.exists() || !plugin_dir.is_dir() {
+        bot.send_message(
+            msg.chat.id,
+            "Директория plugins/ не найдена. Убедитесь, что бот запущен из корня проекта.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut uploaded_count = 0u32;
+    let mut errors = Vec::new();
+
+    let entries = match std::fs::read_dir(plugin_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("Ошибка чтения директории: {}", e))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if name.ends_with(".plugin") => name.to_string(),
+            _ => continue,
+        };
+
+        // Derive the friendly asset name from the filename
+        // e.g. "telega_checker_rust_AyuGram.plugin" → "ayugram"
+        let asset_name = derive_asset_name(&file_name);
+
+        info!(file = %file_name, asset_name = %asset_name, "Uploading plugin asset");
+
+        // Upload the file to Telegram (sends it to the admin chat)
+        match bot
+            .send_document(msg.chat.id, InputFile::file(&path))
+            .await
+        {
+            Ok(sent_msg) => {
+                // Extract the file_id from the sent document
+                if let Some(doc) = sent_msg.document() {
+                    let file_id = &doc.file.id;
+                    if let Err(e) =
+                        db::upsert_plugin_asset(&state.pool, &asset_name, file_id).await
+                    {
+                        error!(asset_name, "Failed to upsert plugin asset: {}", e);
+                        errors.push(format!("{}: DB error", asset_name));
+                    } else {
+                        info!(asset_name, file_id, "Plugin asset uploaded and stored");
+                        uploaded_count += 1;
+                    }
+                } else {
+                    errors.push(format!("{}: no document in response", asset_name));
+                }
+            }
+            Err(e) => {
+                error!(file = %file_name, "Failed to upload plugin: {}", e);
+                errors.push(format!("{}: upload failed", asset_name));
+            }
+        }
+    }
+
+    // Send summary
+    let mut summary = format!("Загружено плагинов: {}", uploaded_count);
+    if !errors.is_empty() {
+        summary.push_str(&format!("\nОшибки:\n{}", errors.join("\n")));
+    }
+
+    bot.send_message(msg.chat.id, summary).await?;
+    Ok(())
+}
+
+// ─── Callback query handler ────────────────────────────────────────────────
+
+/// Handle inline button callbacks: "get_plugins" and "reset_token".
+pub async fn handle_callback_query(
+    bot: Bot,
+    q: CallbackQuery,
+    state: AppState,
+) -> Result<(), teloxide::RequestError> {
+    let data = match q.data.as_deref() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    let user_id = q.from.id.0 as i64;
+
+    match data {
+        "get_plugins" => {
+            // Answer the callback to remove the loading spinner
+            bot.answer_callback_query(&q.id).await?;
+
+            // Use the chat from the original message
+            if let Some(msg) = q.message {
+                let chat_id = msg.chat().id;
+                if let Err(e) = send_plugins_and_token(&bot, chat_id, user_id, &state).await {
+                    error!(user_id, "Failed to handle get_plugins callback: {}", e);
+                }
+            }
+        }
+        "reset_token" => {
+            // Rotate the token
+            match db::rotate_token(&state.pool, user_id).await {
+                Ok(new_token) => {
+                    bot.answer_callback_query(&q.id)
+                        .text("Токен обновлён!")
+                        .await?;
+
+                    if let Some(msg) = q.message {
+                        let chat_id = msg.chat().id;
+                        let text = format!(
+                            "<b>Ваш новый API токен:</b>\n\n\
+                             <code>{}</code>\n\n\
+                             Обновите токен в настройках плагина.",
+                            new_token
+                        );
+                        let keyboard =
+                            InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                                "Сбросить API токен",
+                                "reset_token",
+                            )]]);
+
+                        bot.send_message(chat_id, text)
+                            .parse_mode(teloxide::types::ParseMode::Html)
+                            .reply_markup(keyboard)
+                            .await?;
+                    }
+                }
+                Err(e) => {
+                    error!(user_id, "Failed to rotate token: {}", e);
+                    bot.answer_callback_query(&q.id)
+                        .text("Ошибка при обновлении токена")
+                        .await?;
+                }
+            }
+        }
+        _ => {
+            debug!(data, "Unknown callback query data");
+            bot.answer_callback_query(&q.id).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Shared plugin delivery logic ───────────────────────────────────────────
+
+/// Core logic for delivering plugins and API token. Shared between
+/// the /plugins command and the "get_plugins" callback button.
+async fn send_plugins_and_token(
+    bot: &Bot,
+    chat_id: ChatId,
+    user_id: i64,
+    state: &AppState,
+) -> Result<(), teloxide::RequestError> {
+    // Get or create the user's API token
+    let token = match db::get_or_create_token(&state.pool, user_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!(user_id, "Failed to get/create token: {}", e);
+            bot.send_message(chat_id, "Ошибка при создании API токена.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // Fetch stored plugin assets
+    let assets = match db::get_plugin_assets(&state.pool).await {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Failed to fetch plugin assets: {}", e);
+            bot.send_message(chat_id, "Ошибка при загрузке плагинов.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    if assets.is_empty() {
+        bot.send_message(
+            chat_id,
+            "Плагины ещё не загружены. Администратор должен выполнить /upload_assets.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Send each plugin asset as a document using cached file_id (zero bandwidth)
+    for (name, file_id) in &assets {
+        if let Err(e) = bot
+            .send_document(chat_id, InputFile::file_id(file_id))
+            .await
+        {
+            error!(name, "Failed to send plugin asset: {}", e);
+        }
+    }
+
+    // Build the instruction message
+    let instruction = format!(
+        r#"<b>Инструкция по установке плагинов</b>
+
+1. Скачайте файл(ы) плагина выше.
+2. Переместите .plugin файл в папку <code>plugins/</code> вашего Telegram-клиента (AyuGram или exteraGram).
+3. В настройках плагина укажите ваш персональный API-токен:
+
+<b>Ваш API токен:</b>
+<code>{token}</code>
+
+4. Укажите endpoint API:
+<code>https://telega.berektassuly.me/api/check/</code>
+
+<b>Важно:</b>
+• Токен привязан к вашему Telegram аккаунту.
+• Не передавайте токен третьим лицам.
+• При компрометации — нажмите кнопку ниже для сброса.
+
+Подробная инструкция: /plugins"#
+    );
+
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "Сбросить API токен",
+        "reset_token",
+    )]]);
+
+    bot.send_message(chat_id, instruction)
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .reply_markup(keyboard)
+        .await?;
+
+    info!(user_id, "Plugins and token delivered");
     Ok(())
 }
 
@@ -116,7 +402,7 @@ pub async fn handle_message(
         _ => {
             bot.send_message(
                 msg.chat.id,
-                "⚠️ Пожалуйста, отправь корректный Telegram ID (только цифры).",
+                "Пожалуйста, отправь корректный Telegram ID (только цифры).",
             )
             .await?;
             return Ok(());
@@ -380,4 +666,21 @@ pub fn is_group_chat(msg: &Message) -> bool {
 /// Filter predicate: returns true if the message is from a private chat.
 pub fn is_private_chat(msg: &Message) -> bool {
     matches!(msg.chat.kind, ChatKind::Private(_))
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Derive a friendly asset name from a plugin filename.
+/// e.g. "telega_checker_rust_AyuGram.plugin" → "ayugram"
+/// e.g. "telega_checker_rust_exteraGram.plugin" → "extragam"
+fn derive_asset_name(filename: &str) -> String {
+    // Strip extension
+    let stem = filename.strip_suffix(".plugin").unwrap_or(filename);
+    // Take the last segment after underscore (the client name)
+    let name = stem.rsplit('_').next().unwrap_or(stem);
+    // Normalize: lowercase, remove non-alphanumeric
+    name.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
