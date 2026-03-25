@@ -1,4 +1,5 @@
 services:
+  # ── Rust Backend (Dual-Core: Telegram Bot + HTTP API) ──
   bot:
     build: .
     env_file: .env
@@ -7,7 +8,47 @@ services:
       DATABASE_URL: "sqlite:/app/data/telega_checker.db?mode=rwc"
     volumes:
       - bot_data:/app/data
+    # No port mapping to host — only exposed to the internal Docker network.
+    # Nginx proxies external traffic to bot:8080.
+    expose:
+      - "8080"
     restart: unless-stopped
+    networks:
+      - internal
+
+  # ── Nginx Reverse Proxy (SSL termination + rate limiting) ──
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - certbot_conf:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      - bot
+    restart: unless-stopped
+    networks:
+      - internal
+
+  # ── Certbot (Let's Encrypt SSL certificate management) ──
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot_conf:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    # Run dry-run by default; override with actual domain for production:
+    #   docker compose run certbot certonly --webroot -w /var/www/certbot -d yourdomain.com
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    networks:
+      - internal
 
 volumes:
   bot_data:
+  certbot_conf:
+  certbot_www:
+
+networks:
+  internal:
+    driver: bridge

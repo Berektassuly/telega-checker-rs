@@ -42,3 +42,7 @@ tokio-cron-scheduler = "0.13"
 
 # Stream utilities for concurrency control (buffer_unordered)
 futures = "0.3"
+
+# HTTP API server (Axum) for the BFF / Android plugin endpoint
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }

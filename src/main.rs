@@ -1,4 +1,5 @@
 mod api_client;
+mod api_server;
 mod bot_handler;
 mod config;
 mod db;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use moka::future::Cache;
 use sqlx::sqlite::SqlitePoolOptions;
 use teloxide::prelude::*;
-use tracing::info;
+use tracing::{error, info};
 
 use bot_handler::AppState;
 
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("Starting TelegaChecker bot...");
+    info!("Starting TelegaChecker (Dual-Core: Bot + API)...");
 
     // ── Load configuration ──
     let cfg = config::AppConfig::from_env().context("Failed to load configuration")?;
@@ -75,6 +76,8 @@ async fn main() -> Result<()> {
         .context("Failed initial authentication with okcdn.ru")?;
 
     // ── Build shared state ──
+    // AppState is Clone-friendly: SqlitePool, Cache, and Arc<ApiClient>
+    // all use internal Arc. Both the bot and HTTP server get zero-cost access.
     let state = AppState {
         pool,
         cache,
@@ -165,8 +168,8 @@ async fn main() -> Result<()> {
             Update::filter_inline_query().endpoint(bot_handler::handle_inline_query),
         );
 
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![state])
+    let mut dispatcher = Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![state.clone()])
         .default_handler(|upd| async move {
             tracing::debug!("Unhandled update: {:?}", upd);
         })
@@ -174,11 +177,30 @@ async fn main() -> Result<()> {
             "Error in the dispatcher",
         ))
         .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
 
-    info!("Bot stopped.");
+    // ── Run both cores concurrently ──
+    // tokio::select! races the HTTP API server and the Telegram bot dispatcher.
+    // When either finishes (e.g. on SIGTERM/Ctrl+C), the other is cancelled.
+    let api_bearer_token = cfg.api_bearer_token.clone();
+    let api_port = cfg.api_port;
+    let api_state = state.clone();
+
+    info!("Starting Dual-Core: Telegram Bot + HTTP API on port {}", api_port);
+
+    tokio::select! {
+        result = api_server::run_api_server(api_state, api_bearer_token, api_port) => {
+            match result {
+                Ok(()) => info!("HTTP API server exited gracefully"),
+                Err(e) => error!("HTTP API server error: {}", e),
+            }
+        }
+        () = dispatcher.dispatch() => {
+            info!("Telegram bot dispatcher exited");
+        }
+    }
+
+    info!("TelegaChecker stopped.");
     Ok(())
 }
 

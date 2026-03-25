@@ -50,4 +50,7 @@ COPY --from=builder /build/target/release/telega-checker-rs ./
 # Drop to non-root
 USER appuser
 
+# Expose the HTTP API port (internal Docker network only; Nginx proxies to this)
+EXPOSE 8080
+
 CMD ["./telega-checker-rs"]

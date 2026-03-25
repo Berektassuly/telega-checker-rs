@@ -18,6 +18,9 @@ docker-compose.yml
 docker-compose.yaml
 DEPLOY.md
 
+# Nginx config (mounted separately, not needed in Rust build)
+nginx/
+
 # IDE / editor
 .vscode/
 .idea/
