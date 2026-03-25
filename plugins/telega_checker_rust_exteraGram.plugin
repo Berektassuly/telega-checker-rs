@@ -582,18 +582,39 @@ class TelegaCheckerPlugin(BasePlugin):
         if title_text is None:
             title_text = UserObject.getUserName(user)
 
-        badge = BadgeDTO(int(self._badge_doc_id), None)
+        badge_doc_id_long = jclass("java.lang.Long")(int(self._badge_doc_id))
+        badge = BadgeDTO(badge_doc_id_long, None)
         emoji_status = _get_attr(user, "emoji_status")
-        avatar_container.setTitle(
-            title_text,
-            bool(_get_attr(user, "scam")),
-            bool(_get_attr(user, "fake")),
-            bool(_get_attr(user, "verified")),
-            bool(_get_attr(user, "premium")),
-            badge,
-            emoji_status,
-            bool(animate),
-        )
+        try:
+            set_title_method = None
+            for method in avatar_container.getClass().getDeclaredMethods():
+                if str(method.getName() or "") == "setTitle":
+                    param_types = method.getParameterTypes()
+                    if param_types is not None and len(param_types) >= 8:
+                        set_title_method = method
+                        break
+            
+            if set_title_method is not None:
+                args = [
+                    title_text,
+                    bool(_get_attr(user, "scam")),
+                    bool(_get_attr(user, "fake")),
+                    bool(_get_attr(user, "verified")),
+                    bool(_get_attr(user, "premium")),
+                    badge,
+                    emoji_status,
+                    bool(animate),
+                ]
+                params_count = len(set_title_method.getParameterTypes())
+                while len(args) < params_count:
+                    args.append(False)
+                
+                set_title_method.setAccessible(True)
+                set_title_method.invoke(avatar_container, *args)
+            else:
+                self.log("setTitle method with >= 8 parameters not found")
+        except Exception as exc:
+            self.log(f"setTitle dynamic invoke failed: {exc}")
 
         title_view = _get_attr(avatar_container, "getTitleTextView")
         if title_view is None:
@@ -692,7 +713,8 @@ class TelegaCheckerPlugin(BasePlugin):
         if self._cache_get(user_id) is not True:
             return False
 
-        badge = BadgeDTO(int(self._badge_doc_id), None)
+        badge_doc_id_long = jclass("java.lang.Long")(int(self._badge_doc_id))
+        badge = BadgeDTO(badge_doc_id_long, None)
         listener = lambda _view, profile_activity=profile_activity: self._show_compromised_alert(profile_activity)
 
         applied = False
