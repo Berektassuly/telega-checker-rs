@@ -2,7 +2,7 @@
 
 *Read this in other languages: [English](README.md), [Русский](docs/README_RU.md).*
 
-High-throughput Telegram bot for detecting accounts compromised by the **Telega** man-in-the-middle (MITM) fork client. Written in Rust. Operates in two modes: **reactive** (accepts a Telegram user ID via direct message or inline query) and **passive** (silently tracks group members and runs a daily scheduled scan, reporting compromised accounts). Returns a binary determination: present or absent in Telega's VoIP backend infrastructure.
+High-throughput Telegram bot and HTTP API for detecting accounts compromised by the **Telega** man-in-the-middle (MITM) fork client. Written in Rust. Implements a **Dual-Core BFF (Backend-For-Frontend)** architecture: the Telegram bot (teloxide long-polling) and an Axum HTTP API server run concurrently on the same tokio runtime, sharing the exact same `AppState` (moka cache, SQLite pool, API client). Operates in three modes: **reactive** (direct messages/inline queries), **passive** (group monitoring with daily scans), and **HTTP API** (RESTful endpoint for external clients like the Android plugin). Returns a binary determination: present or absent in Telega's VoIP backend infrastructure.
 
 This is the production-grade Rust port of [notelega](https://github.com/hlnmplus/notelega) (Python/aiogram PoC). The Python implementation validates the detection concept; this implementation is engineered for sustained concurrent load, sub-microsecond cache reads, built-in cache stampede prevention, and a memory footprint two orders of magnitude smaller than the CPython equivalent.
 
@@ -21,6 +21,7 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [Configuration](#configuration)
 - [Deployment](#deployment)
 - [Usage](#usage)
+- [HTTP API](#http-api)
 - [Passive Group Monitoring](#passive-group-monitoring)
 - [Database Schema](#database-schema)
 - [Operational Security Notes](#operational-security-notes)
@@ -99,7 +100,36 @@ The session key expires periodically. The implementation handles this transparen
 
 ## Architecture
 
-The bot implements a three-tier lookup with distinct latency and persistence characteristics at each level. In addition to reactive lookups, the bot operates as a passive group monitor with a daily scheduled scanner.
+The application implements a **Dual-Core** design: a Telegram bot (teloxide) and an HTTP API server (axum) run concurrently on the same tokio runtime via `tokio::select!`, sharing a single `AppState`. This ensures that a cache hit from the bot instantly benefits the API, and vice versa. Both cores feed into a three-tier lookup with distinct latency and persistence characteristics at each level. The bot additionally operates as a passive group monitor with a daily scheduled scanner.
+
+### Network Topology
+
+```
+Android Plugin ──HTTPS──▶ Cloudflare (SSL termination)
+                                    │
+                              HTTPS (Origin Cert)
+                                    │
+                                    ▼
+                              Nginx :443 (rate limiting)
+                                    │
+                               HTTP (internal)
+                                    │
+                                    ▼
+Telegram ──Long Polling──▶ Rust Container :8080
+                              ┌─────────────────┐
+                              │   tokio runtime │
+                              │  ┌─────┐ ┌─────┐│
+                              │  │Axum │ │Telox││
+                              │  │ API │ │ ide ││
+                              │  └──┬──┘ └──┬──┘│
+                              │     └───┬───┘   │
+                              │    AppState     │
+                              │  (shared, zero- │
+                              │   cost clones)  │
+                              └─────────────────┘
+```
+
+The Rust container sits behind an **Nginx reverse proxy** inside Docker. Nginx handles SSL termination (via Cloudflare Origin Certificate) and rate limiting (20 req/s per IP on `/api/`). The container does **not** expose ports to the host — only to the internal Docker network.
 
 ### Passive Monitoring Pipeline
 
@@ -339,14 +369,21 @@ telega-checker-rs/
 ├── Cargo.lock              # Reproducible dependency resolution
 ├── LICENSE                 # Apache License 2.0
 ├── Dockerfile              # Multi-stage build (rust:1.92-slim → debian:bookworm-slim)
-├── docker-compose.yml      # Production deployment with persistent volume
+├── docker-compose.yml      # Docker topology: bot + nginx (Cloudflare Origin SSL)
 ├── .env.example            # Environment variable template
+├── nginx/
+│   ├── conf.d/
+│   │   └── default.conf    # Nginx reverse proxy: rate limiting, SSL, proxy_pass to bot:8080
+│   └── ssl/
+│       ├── origin.pem      # Cloudflare Origin Certificate (not in git)
+│       └── origin-key.pem  # Private key (not in git)
 ├── docs/
 │   ├── README_RU.md        # Russian version of README
 │   └── DEPLOY.md           # Extended deployment instructions
 └── src/
-    ├── main.rs             # Entrypoint: config, pool, caches, dispatcher + scheduler setup
-    ├── config.rs           # AppConfig: env var loading (TELOXIDE_TOKEN, DATABASE_URL, APPLICATION_KEY)
+    ├── main.rs             # Dual-Core entrypoint: tokio::select!(Axum, Teloxide)
+    ├── config.rs           # AppConfig: env var loading (bot token, API token, port, etc.)
+    ├── api_server.rs       # Axum HTTP API: Bearer auth, GET /api/check/:telegram_id
     ├── api_client.rs       # ApiClient: calls.okcdn.ru auth + lookup with session refresh
     ├── bot_handler.rs      # Telegram handlers: /start, message, inline, group tracking; three-tier lookup
     ├── scheduler.rs        # Daily cron scan: iterates active chats, checks members, sends reports
@@ -380,6 +417,8 @@ cp .env.example .env
 | `TELOXIDE_TOKEN` | Yes | -- | Telegram bot token from @BotFather |
 | `DATABASE_URL` | Yes | `sqlite:telega_checker.db?mode=rwc` | SQLite connection string. Overridden to `/app/data/telega_checker.db` in Docker via `docker-compose.yml`. |
 | `APPLICATION_KEY` | No | `CHKIPMKGDIHBABABA` | OK.ru API application key for `calls.okcdn.ru` authentication |
+| `API_BEARER_TOKEN` | Yes | -- | Bearer token for authenticating HTTP API requests (used by Android plugin) |
+| `API_PORT` | No | `8080` | Port for the Axum HTTP API server |
 | `RUST_LOG` | No | `info` | Tracing filter directive. Set to `debug` for verbose output, `warn` for production. |
 
 ---
@@ -387,6 +426,19 @@ cp .env.example .env
 ## Deployment
 
 ### Docker (recommended)
+
+The production topology consists of two Docker services behind Cloudflare Proxy:
+
+| Service | Image | Ports (host) | Role |
+|---|---|---|---|
+| `bot` | build: `.` | None (internal) | Dual-Core Rust app (Telegram bot + HTTP API on :8080) |
+| `nginx` | `nginx:alpine` | `80`, `443` | Reverse proxy, SSL (Cloudflare Origin Cert), rate limiting |
+
+#### Prerequisites
+
+1. **Cloudflare Origin Certificate**: Place `origin.pem` and `origin-key.pem` in `nginx/ssl/`. Generate from Cloudflare Dashboard → SSL/TLS → Origin Server.
+2. **Cloudflare SSL mode**: Set to **Full (strict)** in Dashboard → SSL/TLS → Overview.
+3. **DNS**: Point your domain to the server IP with Cloudflare Proxy enabled (orange cloud).
 
 ```bash
 # Build and start in detached mode
@@ -415,18 +467,18 @@ The named volume `bot_data` mounts to `/app/data` inside the container. The SQLi
 ### Local Development
 
 ```bash
-# Ensure .env is populated
+# Ensure .env is populated (including API_BEARER_TOKEN)
 cargo run --release
 ```
 
-The binary reads `.env` from the working directory via `dotenvy`. The SQLite database is created at the path specified by `DATABASE_URL`.
+The binary reads `.env` from the working directory via `dotenvy`. Both the Telegram bot and HTTP API server start concurrently. The SQLite database is created at the path specified by `DATABASE_URL`.
 
 ### Dockerfile Details
 
 The Dockerfile implements a two-stage build:
 
 1. **Builder stage** (`rust:1.92-slim-bookworm`): Compiles the release binary with a dependency caching layer (dummy `main.rs` trick to cache compiled dependencies separately from application code).
-2. **Runtime stage** (`debian:bookworm-slim`): Minimal image with only `ca-certificates` and `libssl3`. Runs as non-root user `appuser` (UID 1001).
+2. **Runtime stage** (`debian:bookworm-slim`): Minimal image with only `ca-certificates` and `libssl3`. Runs as non-root user `appuser` (UID 1001). Exposes port `8080` for the internal Docker network.
 
 ---
 
@@ -467,6 +519,58 @@ The bot will reply in the group with the lookup result. Invalid or empty IDs are
 ### /start Command
 
 Displays usage instructions and a link to the OSINT article on Telega's interception mechanics.
+
+---
+
+## HTTP API
+
+The Axum HTTP API server exposes a RESTful endpoint for external clients (e.g., the Android plugin). It runs on the same tokio runtime as the Telegram bot and shares the identical `AppState` — cache hits from the bot benefit the API, and vice versa.
+
+### Authentication
+
+All API requests require a Bearer token in the `Authorization` header:
+
+```
+Authorization: Bearer <API_BEARER_TOKEN>
+```
+
+Requests without a valid token receive `401 Unauthorized`.
+
+### Endpoint
+
+#### `GET /api/check/:telegram_id`
+
+Check if a Telegram user ID is registered in Telega's infrastructure.
+
+**Success (200):**
+```json
+{"telegram_id": 123456789, "is_compromised": true}
+```
+
+**Invalid ID (400):**
+```json
+{"error": "Invalid telegram_id 'abc'. Must be a positive integer."}
+```
+
+**Auth failure (401):**
+```json
+{"error": "Invalid bearer token"}
+```
+
+**Server error (500):**
+```json
+{"error": "Internal lookup error. Please try again later."}
+```
+
+### Example
+
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" https://checker.berektassuly.com/api/check/123456789
+```
+
+### Rate Limiting
+
+Nginx enforces **20 requests/second per IP** with a burst of 10 on all `/api/` endpoints. Excess requests receive `429 Too Many Requests`.
 
 ---
 

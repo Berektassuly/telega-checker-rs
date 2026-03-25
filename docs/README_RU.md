@@ -2,7 +2,7 @@
 
 *Прочитать на других языках: [English](../README.md), [Русский](README_RU.md).*
 
-Высокопроизводительный Telegram-бот для обнаружения аккаунтов, скомпрометированных MITM-форком **Telega**. Написан на Rust. Работает в двух режимах: **реактивный** (принимает Telegram user ID через личное сообщение или inline-запрос) и **пассивный** (бесшумно отслеживает участников групп и проводит ежедневное сканирование, отправляя отчёты о скомпрометированных аккаунтах). Возвращает бинарный результат: присутствует или отсутствует в VoIP-инфраструктуре Telega.
+Высокопроизводительный Telegram-бот и HTTP API для обнаружения аккаунтов, скомпрометированных MITM-форком **Telega**. Написан на Rust. Реализует архитектуру **Dual-Core BFF (Backend-For-Frontend)**: Telegram-бот (teloxide long-polling) и HTTP API-сервер (axum) работают параллельно на одном tokio-рантайме, совместно используя один и тот же `AppState` (moka-кеш, SQLite-пул, API-клиент). Работает в трёх режимах: **реактивный** (личные сообщения / inline-запросы), **пассивный** (мониторинг групп с ежедневным сканированием) и **HTTP API** (RESTful-эндпоинт для внешних клиентов, таких как Android-плагин). Возвращает бинарный результат: присутствует или отсутствует в VoIP-инфраструктуре Telega.
 
 Это production-версия на Rust, портированная с [notelega](https://github.com/hlnmplus/notelega) (Python/aiogram PoC). Python-реализация валидирует концепцию детектирования; данная реализация спроектирована для устойчивой конкурентной нагрузки, субмикросекундного чтения из кеша, встроенной защиты от cache stampede и потребления памяти на два порядка меньше, чем у CPython-эквивалента.
 
@@ -21,6 +21,7 @@
 - [Конфигурация](#конфигурация)
 - [Развёртывание](#развёртывание)
 - [Использование](#использование)
+- [HTTP API](#http-api)
 - [Пассивный мониторинг групп](#пассивный-мониторинг-групп)
 - [Схема базы данных](#схема-базы-данных)
 - [Заметки по операционной безопасности](#заметки-по-операционной-безопасности)
@@ -99,7 +100,36 @@ application_key=<APPLICATION_KEY>&session_key=<SESSION_KEY>&externalIds=[{"id":"
 
 ## Архитектура
 
-Бот реализует трёхуровневый поиск с различными характеристиками задержки и персистентности на каждом уровне. Помимо реактивных проверок, бот работает как пассивный монитор групп с ежедневным плановым сканированием.
+Приложение реализует дизайн **Dual-Core**: Telegram-бот (teloxide) и HTTP API-сервер (axum) работают параллельно на одном tokio-рантайме через `tokio::select!`, совместно используя единый `AppState`. Это гарантирует, что попадание в кеш со стороны бота мгновенно приносит пользу API, и наоборот. Оба ядра используют трёхуровневый поиск с различными характеристиками задержки и персистентности на каждом уровне. Бот дополнительно работает как пассивный монитор групп с ежедневным плановым сканированием.
+
+### Сетевая топология
+
+```
+Android-плагин ──HTTPS──▶ Cloudflare (SSL-терминация)
+                                    │
+                              HTTPS (Origin Cert)
+                                    │
+                                    ▼
+                              Nginx :443 (rate limiting)
+                                    │
+                               HTTP (внутренний)
+                                    │
+                                    ▼
+Telegram ──Long Polling──▶ Rust-контейнер :8080
+                              ┌─────────────────┐
+                              │   tokio runtime │
+                              │  ┌─────┐ ┌─────┐│
+                              │  │Axum │ │Telox││
+                              │  │ API │ │ ide ││
+                              │  └──┬──┘ └──┬──┘│
+                              │     └───┬───┘   │
+                              │    AppState     │
+                              │  (общий, zero-  │
+                              │   cost clones)  │
+                              └─────────────────┘
+```
+
+Rust-контейнер находится за **Nginx reverse proxy** внутри Docker. Nginx обрабатывает SSL-терминацию (через Cloudflare Origin Certificate) и rate limiting (20 запросов/с на IP для `/api/`). Контейнер **не** выставляет порты на хост — только во внутреннюю Docker-сеть.
 
 ### Конвейер пассивного мониторинга
 
@@ -339,13 +369,20 @@ telega-checker-rs/
 ├── Cargo.lock              # Воспроизводимое разрешение зависимостей
 ├── LICENSE                 # Лицензия Apache 2.0
 ├── Dockerfile              # Многоступенчатая сборка (rust:1.92-slim → debian:bookworm-slim)
-├── docker-compose.yml      # Production-развёртывание с персистентным томом
+├── docker-compose.yml      # Docker-топология: bot + nginx (Cloudflare Origin SSL)
 ├── .env.example            # Шаблон переменных окружения
+├── nginx/
+│   ├── conf.d/
+│   │   └── default.conf    # Nginx reverse proxy: rate limiting, SSL, proxy_pass на bot:8080
+│   └── ssl/
+│       ├── origin.pem      # Cloudflare Origin Certificate (не в git)
+│       └── origin-key.pem  # Закрытый ключ (не в git)
 ├── docs/
 │   └── DEPLOY.md           # Расширенная инструкция по развёртыванию
 └── src/
-    ├── main.rs             # Точка входа: конфиг, пул, кеши, настройка диспетчера + планировщика
-    ├── config.rs           # AppConfig: загрузка env-переменных (TELOXIDE_TOKEN, DATABASE_URL, APPLICATION_KEY)
+    ├── main.rs             # Dual-Core точка входа: tokio::select!(Axum, Teloxide)
+    ├── config.rs           # AppConfig: загрузка env-переменных (токен бота, API-токен, порт и т.д.)
+    ├── api_server.rs       # Axum HTTP API: Bearer-аутентификация, GET /api/check/:telegram_id
     ├── api_client.rs       # ApiClient: аутентификация + поиск через calls.okcdn.ru с обновлением сессии
     ├── bot_handler.rs      # Telegram-обработчики: /start, сообщения, inline, отслеживание групп; трёхуровневый поиск
     ├── scheduler.rs        # Ежедневное cron-сканирование: итерация по чатам, проверка участников, отправка отчётов
@@ -379,6 +416,8 @@ cp .env.example .env
 | `TELOXIDE_TOKEN` | Да | -- | Токен Telegram-бота от @BotFather |
 | `DATABASE_URL` | Да | `sqlite:telega_checker.db?mode=rwc` | Строка подключения SQLite. В Docker переопределяется на `/app/data/telega_checker.db` через `docker-compose.yml`. |
 | `APPLICATION_KEY` | Нет | `CHKIPMKGDIHBABABA` | Ключ приложения OK.ru API для аутентификации на `calls.okcdn.ru` |
+| `API_BEARER_TOKEN` | Да | -- | Bearer-токен для аутентификации HTTP API-запросов (используется Android-плагином) |
+| `API_PORT` | Нет | `8080` | Порт для Axum HTTP API-сервера |
 | `RUST_LOG` | Нет | `info` | Директива фильтра трейсинга. `debug` для подробного вывода, `warn` для production. |
 
 ---
@@ -386,6 +425,19 @@ cp .env.example .env
 ## Развёртывание
 
 ### Docker (рекомендуется)
+
+Production-топология состоит из двух Docker-сервисов за Cloudflare Proxy:
+
+| Сервис | Образ | Порты (хост) | Роль |
+|---|---|---|---|
+| `bot` | build: `.` | Нет (внутренний) | Dual-Core Rust-приложение (Telegram-бот + HTTP API на :8080) |
+| `nginx` | `nginx:alpine` | `80`, `443` | Reverse proxy, SSL (Cloudflare Origin Cert), rate limiting |
+
+#### Перед развёртыванием
+
+1. **Cloudflare Origin Certificate**: разместите `origin.pem` и `origin-key.pem` в `nginx/ssl/`. Сгенерируйте в Cloudflare Dashboard → SSL/TLS → Origin Server.
+2. **Режим SSL Cloudflare**: установите **Full (strict)** в Dashboard → SSL/TLS → Overview.
+3. **DNS**: направьте домен на IP сервера с включённым Cloudflare Proxy (оранжевое облако).
 
 ```bash
 # Сборка и запуск в фоновом режиме
@@ -414,18 +466,18 @@ docker compose down -v
 ### Локальная разработка
 
 ```bash
-# Убедитесь, что .env заполнен
+# Убедитесь, что .env заполнен (включая API_BEARER_TOKEN)
 cargo run --release
 ```
 
-Бинарник читает `.env` из рабочей директории через `dotenvy`. База данных SQLite создаётся по пути, указанному в `DATABASE_URL`.
+Бинарник читает `.env` из рабочей директории через `dotenvy`. Telegram-бот и HTTP API-сервер запускаются параллельно. База данных SQLite создаётся по пути, указанному в `DATABASE_URL`.
 
 ### Детали Dockerfile
 
 Dockerfile реализует двухступенчатую сборку:
 
 1. **Стадия сборки** (`rust:1.92-slim-bookworm`): компиляция release-бинарника с кешированием зависимостей (трюк с dummy `main.rs` для раздельного кеширования скомпилированных зависимостей и кода приложения).
-2. **Стадия рантайма** (`debian:bookworm-slim`): минимальный образ только с `ca-certificates` и `libssl3`. Запускается от непривилегированного пользователя `appuser` (UID 1001).
+2. **Стадия рантайма** (`debian:bookworm-slim`): минимальный образ только с `ca-certificates` и `libssl3`. Запускается от непривилегированного пользователя `appuser` (UID 1001). Выставляет порт `8080` для внутренней Docker-сети.
 
 ---
 
@@ -466,6 +518,58 @@ Dockerfile реализует двухступенчатую сборку:
 ### Команда /start
 
 Отображает инструкции по использованию и ссылку на OSINT-статью о механизмах перехвата Telega.
+
+---
+
+## HTTP API
+
+Axum HTTP API-сервер предоставляет RESTful-эндпоинт для внешних клиентов (напр., Android-плагин). Работает на том же tokio-рантайме, что и Telegram-бот, и использует идентичный `AppState` — попадания в кеш со стороны бота приносят пользу API, и наоборот.
+
+### Аутентификация
+
+Все API-запросы требуют Bearer-токен в заголовке `Authorization`:
+
+```
+Authorization: Bearer <API_BEARER_TOKEN>
+```
+
+Запросы без валидного токена получают ответ `401 Unauthorized`.
+
+### Эндпоинт
+
+#### `GET /api/check/:telegram_id`
+
+Проверяет, зарегистрирован ли Telegram user ID в инфраструктуре Telega.
+
+**Успех (200):**
+```json
+{"telegram_id": 123456789, "is_compromised": true}
+```
+
+**Невалидный ID (400):**
+```json
+{"error": "Invalid telegram_id 'abc'. Must be a positive integer."}
+```
+
+**Ошибка аутентификации (401):**
+```json
+{"error": "Invalid bearer token"}
+```
+
+**Ошибка сервера (500):**
+```json
+{"error": "Internal lookup error. Please try again later."}
+```
+
+### Пример
+
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" https://checker.berektassuly.com/api/check/123456789
+```
+
+### Rate Limiting
+
+Nginx ограничивает запросы до **20 запросов/секунду на IP** с burst=10 на всех `/api/`-эндпоинтах. Избыточные запросы получают ответ `429 Too Many Requests`.
 
 ---
 
