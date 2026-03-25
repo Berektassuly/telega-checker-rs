@@ -25,6 +25,7 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [Passive Group Monitoring](#passive-group-monitoring)
 - [Database Schema](#database-schema)
 - [Operational Security Notes](#operational-security-notes)
+- [Client Plugins](#client-plugins)
 - [License](#license)
 
 ---
@@ -384,6 +385,11 @@ telega-checker-rs/
 │   └── ssl/
 │       ├── origin.pem      # Cloudflare Origin Certificate (not in git)
 │       └── origin-key.pem  # Private key (not in git)
+├── plugins/
+│   ├── README.md                                # Plugin documentation (EN)
+│   ├── README_RU.md                             # Plugin documentation (RU)
+│   ├── telega_checker_rust_AyuGram.plugin        # AyuGram edition (TextDetailCell injection)
+│   └── telega_checker_rust_exteraGram.plugin     # exteraGram edition (Badge injection)
 ├── docs/
 │   ├── README_RU.md        # Russian version of README
 │   └── DEPLOY.md           # Extended deployment instructions
@@ -698,6 +704,19 @@ volumes:
 ```
 
 Note that this also makes the L2 cache (`known_users`) ephemeral, requiring all lookups to hit L3 until the cache repopulates.
+
+---
+
+## Client Plugins
+
+Android detection plugins for AyuGram and exteraGram that consume the HTTP API to provide real-time UI indicators of a user's Telega status. Each plugin hooks into the client's UI via Java reflection and method hooking, performs asynchronous HTTPS lookups against this backend, and caches results locally (6-hour TTL).
+
+| Client | Version | Download |
+|---|---|---|
+| **AyuGram** | v1.1.0 | [Download Plugin](https://github.com/Berektassuly/telega-checker-rs/raw/main/plugins/telega_checker_rust_AyuGram.plugin) |
+| **exteraGram** | v1.1.0 | [Download Plugin](https://github.com/Berektassuly/telega-checker-rs/raw/main/plugins/telega_checker_rust_exteraGram.plugin) |
+
+For full documentation — architecture, installation, configuration, security analysis, and client-specific feature comparison — see the [Plugin README](plugins/README.md).
 
 ---
 

@@ -25,6 +25,7 @@
 - [Пассивный мониторинг групп](#пассивный-мониторинг-групп)
 - [Схема базы данных](#схема-базы-данных)
 - [Заметки по операционной безопасности](#заметки-по-операционной-безопасности)
+- [Клиентские плагины](#клиентские-плагины)
 - [Лицензия](#лицензия)
 
 ---
@@ -384,6 +385,11 @@ telega-checker-rs/
 │   └── ssl/
 │       ├── origin.pem      # Cloudflare Origin Certificate (не в git)
 │       └── origin-key.pem  # Закрытый ключ (не в git)
+├── plugins/
+│   ├── README.md                                # Документация плагинов (EN)
+│   ├── README_RU.md                             # Документация плагинов (RU)
+│   ├── telega_checker_rust_AyuGram.plugin        # Версия для AyuGram (инъекция TextDetailCell)
+│   └── telega_checker_rust_exteraGram.plugin     # Версия для exteraGram (инъекция Badge)
 ├── docs/
 │   └── DEPLOY.md           # Расширенная инструкция по развёртыванию
 └── src/
@@ -697,6 +703,19 @@ volumes:
 ```
 
 Учтите, что это также делает L2-кеш (`known_users`) эфемерным, вынуждая все запросы обращаться к L3 до повторного заполнения кеша.
+
+---
+
+## Клиентские плагины
+
+Android-плагины для AyuGram и exteraGram, использующие HTTP API для отображения индикаторов статуса Telega в реальном времени. Каждый плагин внедряется в UI клиента через рефлексию Java и перехват методов, выполняет асинхронные HTTPS-запросы к бэкенду и кеширует результаты локально (TTL 6 часов).
+
+| Клиент | Версия | Скачать |
+|---|---|---|
+| **AyuGram** | v1.1.0 | [Скачать плагин](https://github.com/Berektassuly/telega-checker-rs/raw/main/plugins/telega_checker_rust_AyuGram.plugin) |
+| **exteraGram** | v1.1.0 | [Скачать плагин](https://github.com/Berektassuly/telega-checker-rs/raw/main/plugins/telega_checker_rust_exteraGram.plugin) |
+
+Полная документация — архитектура, установка, конфигурация, анализ безопасности и сравнение функций по клиентам — в [README плагинов](../plugins/README_RU.md).
 
 ---
 

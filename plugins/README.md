@@ -1,5 +1,7 @@
 # Telega Checker — Client Plugins
 
+*Read this in other languages: [English](README.md), [Русский](README_RU.md).*
+
 Android detection plugins for [AyuGram](https://github.com/AyuGram) and [exteraGram](https://github.com/AyuGram/AyuGram4A) Telegram clients. Each plugin interfaces with the [telega-checker-rs](https://github.com/Berektassuly/telega-checker-rs) Rust backend to identify users of the Telega man-in-the-middle fork client in real time.
 
 **Author:** [@Berektassuly](https://github.com/Berektassuly)
