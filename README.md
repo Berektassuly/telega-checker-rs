@@ -24,6 +24,7 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [Passive Group Monitoring](#passive-group-monitoring)
 - [Database Schema](#database-schema)
 - [Operational Security Notes](#operational-security-notes)
+- [License](#license)
 
 ---
 
@@ -336,6 +337,7 @@ L3 latency is network-dominant and equivalent across implementations. The perfor
 telega-checker-rs/
 ├── Cargo.toml              # Dependencies and package metadata
 ├── Cargo.lock              # Reproducible dependency resolution
+├── LICENSE                 # Apache License 2.0
 ├── Dockerfile              # Multi-stage build (rust:1.92-slim → debian:bookworm-slim)
 ├── docker-compose.yml      # Production deployment with persistent volume
 ├── .env.example            # Environment variable template
@@ -584,3 +586,9 @@ volumes:
 ```
 
 Note that this also makes the L2 cache (`known_users`) ephemeral, requiring all lookups to hit L3 until the cache repopulates.
+
+---
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
