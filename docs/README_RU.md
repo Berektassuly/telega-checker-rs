@@ -24,6 +24,7 @@
 - [HTTP API](#http-api)
 - [Пассивный мониторинг групп](#пассивный-мониторинг-групп)
 - [Схема базы данных](#схема-базы-данных)
+- [Приватность и псевдонимизация аналитики](#приватность-и-псевдонимизация-аналитики)
 - [Заметки по операционной безопасности](#заметки-по-операционной-безопасности)
 - [Клиентские плагины](#клиентские-плагины)
 - [Лицензия](#лицензия)
@@ -106,14 +107,11 @@ application_key=<APPLICATION_KEY>&session_key=<SESSION_KEY>&externalIds=[{"id":"
 ### Сетевая топология
 
 ```
-Android-плагин ──HTTPS──▶ Cloudflare (SSL-терминация)
+Android-плагин ──HTTPS──▶ Cloudflare Edge (SSL-терминация)
                                     │
-                              HTTPS (Origin Cert)
-                                    │
-                                    ▼
-                              Nginx :443 (rate limiting)
-                                    │
-                               HTTP (внутренний)
+                              Cloudflare Tunnel
+                            (исходящее соединение,
+                             входящие порты не нужны)
                                     │
                                     ▼
 Telegram ──Long Polling──▶ Rust-контейнер :8080
@@ -130,7 +128,7 @@ Telegram ──Long Polling──▶ Rust-контейнер :8080
                               └─────────────────┘
 ```
 
-Rust-контейнер находится за **Nginx reverse proxy** внутри Docker. Nginx обрабатывает SSL-терминацию (через Cloudflare Origin Certificate) и rate limiting (20 запросов/с на IP для `/api/`). Контейнер **не** выставляет порты на хост — только во внутреннюю Docker-сеть.
+Rust-контейнер подключается к публичному интернету через **Cloudflare Tunnel** (`cloudflared`). Туннель устанавливает исходящее соединение с edge-сетью Cloudflare — входящие порты на хост-машине не требуются, что исключает необходимость проброса портов, настройки reverse proxy или origin SSL-сертификатов. Cloudflare обрабатывает SSL-терминацию, DDoS-защиту и rate limiting на edge. Контейнер **не** выставляет порты на хост — только во внутреннюю Docker-сеть, где его достигает `cloudflared`.
 
 ### Конвейер пассивного мониторинга
 
@@ -154,7 +152,7 @@ Rust-контейнер находится за **Nginx reverse proxy** внут
 ### Трёхуровневый поиск
 
 ```
-Telegram Update (Message | InlineQuery)
+Telegram Update (Message | InlineQuery | HTTP API)
         |
         v
    Валидация ввода (parse i64, отклонение неположительных)
@@ -186,7 +184,7 @@ Telegram Update (Message | InlineQuery)
 +-------+---------------------------+
         |
         v
-   Ответ в Telegram
+   Ответ (Telegram / HTTP JSON)
 ```
 
 ### Защита от cache stampede
@@ -311,7 +309,7 @@ flowchart TD
     PERSIST --> CACHE_TRUE["return Ok(true)<br/>→ кеш 24ч TTL"]
     FOUND -- "false" --> CACHE_FALSE["return Ok(false)<br/>→ кеш 24ч TTL<br/>(негативный кеш)"]
 
-    CACHE_TRUE --> LOG_REQ["db::log_request(user_id, id, result)"]
+    CACHE_TRUE --> LOG_REQ["db::log_request(user_hash, id, result)<br/>(псевдонимизировано)"]
     CACHE_FALSE --> LOG_REQ
     L1_RETURN --> LOG_REQ
     L2_RETURN --> LOG_REQ
@@ -377,29 +375,25 @@ telega-checker-rs/
 ├── Cargo.lock              # Воспроизводимое разрешение зависимостей
 ├── LICENSE                 # Лицензия Apache 2.0
 ├── Dockerfile              # Многоступенчатая сборка (rust:1.92-slim → debian:bookworm-slim)
-├── docker-compose.yml      # Docker-топология: bot + nginx (Cloudflare Origin SSL)
+├── docker-compose.yml      # Docker-топология: bot + cloudflared (Cloudflare Tunnel)
 ├── .env.example            # Шаблон переменных окружения
-├── nginx/
-│   ├── conf.d/
-│   │   └── default.conf    # Nginx reverse proxy: rate limiting, SSL, proxy_pass на bot:8080
-│   └── ssl/
-│       ├── origin.pem      # Cloudflare Origin Certificate (не в git)
-│       └── origin-key.pem  # Закрытый ключ (не в git)
 ├── plugins/
 │   ├── README.md                                # Документация плагинов (EN)
 │   ├── README_RU.md                             # Документация плагинов (RU)
 │   ├── telega_checker_rust_AyuGram.plugin        # Версия для AyuGram (инъекция TextDetailCell)
 │   └── telega_checker_rust_exteraGram.plugin     # Версия для exteraGram (инъекция Badge)
 ├── docs/
+│   ├── README_RU.md        # Русская версия README
 │   └── DEPLOY.md           # Расширенная инструкция по развёртыванию
 └── src/
     ├── main.rs             # Dual-Core точка входа: tokio::select!(Axum, Teloxide, Ctrl+C) с graceful shutdown
-    ├── config.rs           # AppConfig: загрузка env-переменных (токен бота, API-токен, порт, размер пула БД и т.д.)
-    ├── api_server.rs       # Axum HTTP API: Bearer-аутентификация, GET /api/check/:telegram_id
+    ├── config.rs           # AppConfig: загрузка env-переменных + автогенерация pepper для аналитики
+    ├── crypto.rs           # HMAC-SHA256 псевдонимизация для аналитики (усечённые 128-битные хеши)
+    ├── api_server.rs       # Axum HTTP API: двойная Bearer-аутентификация, GET /api/check/:telegram_id
     ├── api_client.rs       # ApiClient: аутентификация + поиск через calls.okcdn.ru с обновлением сессии + экспоненциальный backoff 429
-    ├── bot_handler.rs      # Telegram-обработчики: /start, сообщения, inline, отслеживание групп; трёхуровневый поиск
+    ├── bot_handler.rs      # Telegram-обработчики: /start, /plugins, /upload_assets, /delete_asset, inline, отслеживание групп, callback-запросы
     ├── scheduler.rs        # Ежедневное cron-сканирование: возвращает хэндл для graceful shutdown; итерация по чатам, проверка участников
-    └── db.rs               # Инициализация схемы SQLite, CRUD known_users + chat_members, аналитическое логирование
+    └── db.rs               # Инициализация схемы SQLite, CRUD для known_users, chat_members, api_tokens, plugin_assets, псевдонимизированная аналитика
 ```
 
 ---
@@ -409,6 +403,7 @@ telega-checker-rs/
 - [Docker](https://docs.docker.com/get-docker/) и [Docker Compose](https://docs.docker.com/compose/install/)
 - Токен Telegram-бота от [@BotFather](https://t.me/BotFather)
 - Включённый inline-режим для бота (через BotFather: `/setinline`)
+- Токен [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) для предоставления доступа к HTTP API
 
 Для локальной разработки без Docker:
 - Rust 1.92+ (edition 2024)
@@ -429,10 +424,14 @@ cp .env.example .env
 | `TELOXIDE_TOKEN` | Да | -- | Токен Telegram-бота от @BotFather |
 | `DATABASE_URL` | Да | `sqlite:telega_checker.db?mode=rwc` | Строка подключения SQLite. В Docker переопределяется на `/app/data/telega_checker.db` через `docker-compose.yml`. |
 | `APPLICATION_KEY` | Нет | `CHKIPMKGDIHBABABA` | Ключ приложения OK.ru API для аутентификации на `calls.okcdn.ru` |
-| `API_BEARER_TOKEN` | Да | -- | Bearer-токен для аутентификации HTTP API-запросов (используется Android-плагином) |
+| `API_BEARER_TOKEN` | Да | -- | Статический Bearer-токен для HTTP API аутентификации (обратная совместимость; также принимает per-user токены) |
 | `API_PORT` | Нет | `8080` | Порт для Axum HTTP API-сервера |
 | `DATABASE_MAX_CONNECTIONS` | Нет | `5` | Максимальный размер пула соединений SQLite. Увеличьте для развёртываний с большим количеством конкурентных сканирований групп. |
+| `ADMIN_ID` | Да | -- | Telegram user ID администратора бота. Необходим для команд администратора (`/upload_assets`, `/delete_asset`). |
+| `CLOUDFLARE_TUNNEL_TOKEN` | Да (Docker) | -- | Токен Cloudflare Tunnel для сервиса `cloudflared`. Сгенерируйте в Cloudflare Zero Trust Dashboard → Networks → Tunnels. |
 | `RUST_LOG` | Нет | `info` | Директива фильтра трейсинга. `debug` для подробного вывода, `warn` для production. |
+
+**Автогенерируемый файл:** При первом запуске приложение создаёт файл `.analytics_key`, содержащий криптографический pepper (два конкатенированных UUID v4) для HMAC-SHA256 псевдонимизации аналитических данных. Файл размещается в той же директории, что и база данных SQLite, и должен сохраняться между перезапусками для обеспечения консистентности псевдонимизированных идентификаторов. См. [Приватность и псевдонимизация аналитики](#приватность-и-псевдонимизация-аналитики).
 
 ---
 
@@ -440,18 +439,18 @@ cp .env.example .env
 
 ### Docker (рекомендуется)
 
-Production-топология состоит из двух Docker-сервисов за Cloudflare Proxy:
+Production-топология состоит из двух Docker-сервисов:
 
 | Сервис | Образ | Порты (хост) | Роль |
 |---|---|---|---|
 | `bot` | build: `.` | Нет (внутренний) | Dual-Core Rust-приложение (Telegram-бот + HTTP API на :8080) |
-| `nginx` | `nginx:alpine` | `80`, `443` | Reverse proxy, SSL (Cloudflare Origin Cert), rate limiting |
+| `cloudflared` | `cloudflare/cloudflared:latest` | Нет | Cloudflare Tunnel — безопасное исходящее соединение с edge-сетью Cloudflare |
 
 #### Перед развёртыванием
 
-1. **Cloudflare Origin Certificate**: разместите `origin.pem` и `origin-key.pem` в `nginx/ssl/`. Сгенерируйте в Cloudflare Dashboard → SSL/TLS → Origin Server.
-2. **Режим SSL Cloudflare**: установите **Full (strict)** в Dashboard → SSL/TLS → Overview.
-3. **DNS**: направьте домен на IP сервера с включённым Cloudflare Proxy (оранжевое облако).
+1. **Cloudflare Tunnel**: создайте туннель в [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels. Настройте маршрутизацию трафика домена на `http://bot:8080`. Скопируйте токен туннеля в `.env` как `CLOUDFLARE_TUNNEL_TOKEN`.
+2. **Cloudflare DNS**: направьте домен на туннель (автоматически настраивается при создании маршрута туннеля).
+3. **SSL-сертификаты не требуются**: Cloudflare обрабатывает SSL-терминацию на edge. Никаких origin-сертификатов, Nginx или проброса портов.
 
 ```bash
 # Сборка и запуск в фоновом режиме
@@ -471,16 +470,16 @@ docker compose down
 docker compose down -v
 ```
 
-Именованный том `bot_data` монтируется в `/app/data` внутри контейнера. База данных SQLite сохраняется между циклами `down` + `up`.
+Именованный том `bot_data` монтируется в `/app/data` внутри контейнера. База данных SQLite и файл `.analytics_key` сохраняются между циклами `down` + `up`.
 
 | Том | Путь в контейнере | Содержимое |
 |---|---|---|
-| `bot_data` | `/app/data` | `telega_checker.db`, `*.db-wal`, `*.db-shm` |
+| `bot_data` | `/app/data` | `telega_checker.db`, `*.db-wal`, `*.db-shm`, `.analytics_key` |
 
 ### Локальная разработка
 
 ```bash
-# Убедитесь, что .env заполнен (включая API_BEARER_TOKEN)
+# Убедитесь, что .env заполнен (включая API_BEARER_TOKEN и ADMIN_ID)
 cargo run --release
 ```
 
@@ -491,7 +490,7 @@ cargo run --release
 Dockerfile реализует двухступенчатую сборку:
 
 1. **Стадия сборки** (`rust:1.92-slim-bookworm`): компиляция release-бинарника с кешированием зависимостей (трюк с dummy `main.rs` для раздельного кеширования скомпилированных зависимостей и кода приложения).
-2. **Стадия рантайма** (`debian:bookworm-slim`): минимальный образ только с `ca-certificates` и `libssl3`. Запускается от непривилегированного пользователя `appuser` (UID 1001). Выставляет порт `8080` для внутренней Docker-сети.
+2. **Стадия рантайма** (`debian:bookworm-slim`): минимальный образ только с `ca-certificates` и `libssl3`. Копирует директорию `plugins/` в образ для команды администратора `/upload_assets`. Запускается от непривилегированного пользователя `appuser` (UID 1001). Выставляет порт `8080` для внутренней Docker-сети.
 
 ---
 
@@ -506,8 +505,8 @@ Dockerfile реализует двухступенчатую сборку:
 ```
 
 Ответ:
-- Присутствует в инфраструктуре Telega: `ДА -- этот ID зарегистрирован в Telega.`
-- Не найден: `НЕТ -- этот ID не найден в Telega.`
+- Присутствует в инфраструктуре Telega: `✅ ДА — этот ID зарегистрирован в Telega.`
+- Не найден: `❌ НЕТ — этот ID не найден в Telega.`
 
 ### Inline-запрос
 
@@ -531,7 +530,20 @@ Dockerfile реализует двухступенчатую сборку:
 
 ### Команда /start
 
-Отображает инструкции по использованию и ссылку на OSINT-статью о механизмах перехвата Telega.
+Отображает инструкции по использованию, ссылку на OSINT-статью о механизмах перехвата Telega и inline-кнопку для загрузки плагинов и получения персонального API-токена.
+
+### Команда /plugins
+
+Доступна только в личных сообщениях. Доставляет файлы плагинов как Telegram-документы (используя кешированный `file_id` для нулевой нагрузки на канал), генерирует или получает персональный API-токен пользователя и предоставляет инструкции по установке. Включает inline-кнопку «Сбросить API токен» для ротации токена.
+
+### Команды администратора
+
+Ограничены пользователем `ADMIN_ID`. Фильтрация на уровне диспетчера и внутри каждого обработчика (defense-in-depth).
+
+| Команда | Описание |
+|---|---|
+| `/upload_assets` | Читает `.plugin` файлы из директории `plugins/`, загружает их в Telegram и сохраняет полученные `file_id` в таблице `plugin_assets` для последующей доставки с нулевой нагрузкой на канал. |
+| `/delete_asset <имя>` | Удаляет конкретный плагин из базы данных по его производному имени (напр., `ayugram`). |
 
 ---
 
@@ -544,8 +556,13 @@ Axum HTTP API-сервер предоставляет RESTful-эндпоинт �
 Все API-запросы требуют Bearer-токен в заголовке `Authorization`:
 
 ```
-Authorization: Bearer <API_BEARER_TOKEN>
+Authorization: Bearer <TOKEN>
 ```
+
+Сервер принимает два типа токенов (двойная валидация):
+
+1. **Статический токен** — переменная окружения `API_BEARER_TOKEN` (обратная совместимость, административное/тестовое использование).
+2. **Per-user токены** — UUID v4 токены, генерируемые через команду `/plugins` и хранящиеся в таблице `api_tokens`. Каждый пользователь получает уникальный токен, привязанный к его Telegram-аккаунту, с возможностью ротации через кнопку «Сбросить API токен».
 
 Запросы без валидного токена получают ответ `401 Unauthorized`.
 
@@ -578,12 +595,12 @@ Authorization: Bearer <API_BEARER_TOKEN>
 ### Пример
 
 ```bash
-curl -H "Authorization: Bearer YOUR_TOKEN" https://checker.berektassuly.com/api/check/123456789
+curl -H "Authorization: Bearer YOUR_TOKEN" https://tc.berektassuly.com/api/check/123456789
 ```
 
 ### Rate Limiting
 
-Nginx ограничивает запросы до **20 запросов/секунду на IP** с burst=10 на всех `/api/`-эндпоинтах. Избыточные запросы получают ответ `429 Too Many Requests`.
+Rate limiting обрабатывается на edge-уровне Cloudflare через WAF-правила или Cloudflare Rate Limiting, заменяя предыдущий подход на базе Nginx.
 
 ---
 
@@ -636,27 +653,26 @@ CREATE TABLE IF NOT EXISTS known_users (
 );
 ```
 
-### `bot_users` (аналитика)
+### `bot_users` (псевдонимизированная аналитика)
 
-Отслеживает пользователей, взаимодействовавших с ботом. Используется для статистики и rate-limiting.
+Отслеживает пользователей, взаимодействовавших с ботом, через усечённые HMAC-SHA256 хеши. Сырые Telegram user ID и имена пользователей не хранятся.
 
 ```sql
 CREATE TABLE IF NOT EXISTS bot_users (
-    user_id    INTEGER PRIMARY KEY,
-    username   TEXT,
+    user_hash  TEXT PRIMARY KEY,
     first_seen TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
-### `requests_log` (аналитика)
+### `requests_log` (псевдонимизированная аналитика)
 
-Append-only журнал всех событий поиска. Обеспечивает операционный мониторинг и анализ паттернов запросов.
+Append-only журнал всех событий поиска. Использует тот же HMAC-SHA256 псевдонимизированный идентификатор, что и `bot_users`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS requests_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
+    user_hash  TEXT    NOT NULL,
     queried_id INTEGER NOT NULL,
     result     TEXT    NOT NULL,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -676,13 +692,55 @@ CREATE TABLE IF NOT EXISTS chat_members (
 );
 ```
 
+### `api_tokens` (per-user доступ к API)
+
+Хранит per-user API-токены для аутентифицированного доступа к HTTP API. Каждый пользователь получает UUID v4 токен при первом запросе `/plugins`, с поддержкой ротации токена.
+
+```sql
+CREATE TABLE IF NOT EXISTS api_tokens (
+    user_id    INTEGER PRIMARY KEY,
+    api_token  TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### `plugin_assets` (доставка плагинов)
+
+Персистентное хранилище Telegram `file_id` загруженных файлов плагинов. Обеспечивает повторную доставку плагинов с нулевыми затратами трафика через ссылки на кешированные файлы на серверах Telegram.
+
+```sql
+CREATE TABLE IF NOT EXISTS plugin_assets (
+    name       TEXT PRIMARY KEY,
+    file_id    TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+---
+
+## Приватность и псевдонимизация аналитики
+
+Все аналитические таблицы (`bot_users`, `requests_log`) хранят псевдонимизированные идентификаторы вместо сырых Telegram user ID или имён пользователей. Реализовано через схему **zero-knowledge HMAC-SHA256**:
+
+1. **Генерация pepper**: при первом запуске приложение генерирует криптографический pepper (два конкатенированных UUID v4, 72 символа энтропии) и сохраняет его в `.analytics_key` рядом с базой данных SQLite. Этот файл должен сохраняться между перезапусками.
+
+2. **Хеширование**: каждый Telegram user ID преобразуется через `HMAC-SHA256(pepper, user_id_bytes)`, затем усекается до 32 hex-символов (128 бит). Одна и та же пара `(user_id, pepper)` всегда даёт одинаковый хеш, сохраняя аналитическую консистентность.
+
+3. **Свойства**:
+   - **Детерминистичность**: повторные взаимодействия одного пользователя дают одинаковый хеш, обеспечивая статистику использования и дедупликацию.
+   - **Необратимость**: pepper никогда не передаётся через API или команды бота. Без pepper хеши не могут быть обращены в Telegram ID.
+   - **Zero-knowledge**: оператор может наблюдать паттерны использования без идентификации конкретных пользователей.
+
+Модуль `crypto.rs` реализует функцию хеширования. Pepper загружается с диска через `config.rs` и внедряется в `AppState` для использования всеми обработчиками.
+
 ---
 
 ## Заметки по операционной безопасности
 
 Таблицы `bot_users` и `requests_log` предоставлены для операционной аналитики (статистика использования, отладка, принятие решений по rate-limiting). Они не требуются для основного функционала детектирования. Единственная таблица, необходимая для корректной работы трёхуровневого поиска -- `known_users`.
 
-Операторы, развёртывающие бот в средах с приоритетом минимизации метаданных, могут отключить аналитическое логирование, удалив или закомментировав вызовы `db::log_request()` и `db::log_bot_user()` в `src/bot_handler.rs`. Это простая модификация, ограниченная двумя точками вызова в `handle_message` и одной в `handle_inline_query`.
+Операторы, развёртывающие бот в средах с приоритетом минимизации метаданных, могут отключить аналитическое логирование, удалив или закомментировав вызовы `db::log_request()` и `db::log_bot_user()` в `src/bot_handler.rs`. Это простая модификация, ограниченная точками вызова в `handle_message`, `handle_inline_query` и `handle_mention_lookup`.
 
 Альтернативный подход для операторов, которым нужна аналитика при разработке, но не в production: введение feature-флага Cargo (напр., `analytics`), условно компилирующего код логирования. Пример добавления в `Cargo.toml`:
 
@@ -702,7 +760,7 @@ volumes:
     target: /app/data
 ```
 
-Учтите, что это также делает L2-кеш (`known_users`) эфемерным, вынуждая все запросы обращаться к L3 до повторного заполнения кеша.
+Учтите, что это также делает L2-кеш (`known_users`), pepper для аналитики (`.analytics_key`) и per-user API-токены (`api_tokens`) эфемерными, вынуждая все запросы обращаться к L3 до повторного заполнения кеша и выпуска новых токенов при каждом перезапуске.
 
 ---
 

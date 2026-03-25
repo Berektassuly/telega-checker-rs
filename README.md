@@ -24,6 +24,7 @@ This is the production-grade Rust port of [notelega](https://github.com/hlnmplus
 - [HTTP API](#http-api)
 - [Passive Group Monitoring](#passive-group-monitoring)
 - [Database Schema](#database-schema)
+- [Privacy & Analytics Pseudonymization](#privacy--analytics-pseudonymization)
 - [Operational Security Notes](#operational-security-notes)
 - [Client Plugins](#client-plugins)
 - [License](#license)
@@ -106,14 +107,11 @@ The application implements a **Dual-Core** design: a Telegram bot (teloxide) and
 ### Network Topology
 
 ```
-Android Plugin ──HTTPS──▶ Cloudflare (SSL termination)
+Android Plugin ──HTTPS──▶ Cloudflare Edge (SSL termination)
                                     │
-                              HTTPS (Origin Cert)
-                                    │
-                                    ▼
-                              Nginx :443 (rate limiting)
-                                    │
-                               HTTP (internal)
+                              Cloudflare Tunnel
+                            (outbound-only, zero
+                             inbound ports open)
                                     │
                                     ▼
 Telegram ──Long Polling──▶ Rust Container :8080
@@ -130,7 +128,7 @@ Telegram ──Long Polling──▶ Rust Container :8080
                               └─────────────────┘
 ```
 
-The Rust container sits behind an **Nginx reverse proxy** inside Docker. Nginx handles SSL termination (via Cloudflare Origin Certificate) and rate limiting (20 req/s per IP on `/api/`). The container does **not** expose ports to the host — only to the internal Docker network.
+The Rust container connects to the public internet through **Cloudflare Tunnel** (`cloudflared`). The tunnel establishes an outbound-only connection to Cloudflare's edge network — no inbound ports are required on the host machine, eliminating the need for port forwarding, reverse proxy configuration, or origin SSL certificates. Cloudflare handles SSL termination, DDoS protection, and rate limiting at the edge. The container does **not** expose ports to the host — only to the internal Docker network where `cloudflared` reaches it.
 
 ### Passive Monitoring Pipeline
 
@@ -154,7 +152,7 @@ A `tokio-cron-scheduler` job runs at **09:00 UTC** daily. The scheduler handle i
 ### Three-Tier Lookup
 
 ```
-Telegram Update (Message | InlineQuery)
+Telegram Update (Message | InlineQuery | HTTP API)
         |
         v
    Input Validation (parse i64, reject non-positive)
@@ -186,7 +184,7 @@ Telegram Update (Message | InlineQuery)
 +-------+---------------------------+
         |
         v
-   Telegram Response
+   Response (Telegram / HTTP JSON)
 ```
 
 ### Cache Stampede Prevention
@@ -311,7 +309,7 @@ flowchart TD
     PERSIST --> CACHE_TRUE["return Ok(true)<br/>→ cached 24h TTL"]
     FOUND -- "false" --> CACHE_FALSE["return Ok(false)<br/>→ cached 24h TTL<br/>(negative cache)"]
 
-    CACHE_TRUE --> LOG_REQ["db::log_request(user_id, id, result)"]
+    CACHE_TRUE --> LOG_REQ["db::log_request(user_hash, id, result)<br/>(pseudonymized)"]
     CACHE_FALSE --> LOG_REQ
     L1_RETURN --> LOG_REQ
     L2_RETURN --> LOG_REQ
@@ -377,14 +375,8 @@ telega-checker-rs/
 ├── Cargo.lock              # Reproducible dependency resolution
 ├── LICENSE                 # Apache License 2.0
 ├── Dockerfile              # Multi-stage build (rust:1.92-slim → debian:bookworm-slim)
-├── docker-compose.yml      # Docker topology: bot + nginx (Cloudflare Origin SSL)
+├── docker-compose.yml      # Docker topology: bot + cloudflared (Cloudflare Tunnel)
 ├── .env.example            # Environment variable template
-├── nginx/
-│   ├── conf.d/
-│   │   └── default.conf    # Nginx reverse proxy: rate limiting, SSL, proxy_pass to bot:8080
-│   └── ssl/
-│       ├── origin.pem      # Cloudflare Origin Certificate (not in git)
-│       └── origin-key.pem  # Private key (not in git)
 ├── plugins/
 │   ├── README.md                                # Plugin documentation (EN)
 │   ├── README_RU.md                             # Plugin documentation (RU)
@@ -395,12 +387,13 @@ telega-checker-rs/
 │   └── DEPLOY.md           # Extended deployment instructions
 └── src/
     ├── main.rs             # Dual-Core entrypoint: tokio::select!(Axum, Teloxide, Ctrl+C) with graceful shutdown
-    ├── config.rs           # AppConfig: env var loading (bot token, API token, port, DB pool size, etc.)
-    ├── api_server.rs       # Axum HTTP API: Bearer auth, GET /api/check/:telegram_id
+    ├── config.rs           # AppConfig: env var loading + auto-generated analytics pepper
+    ├── crypto.rs           # HMAC-SHA256 pseudonymization for analytics (truncated 128-bit hashes)
+    ├── api_server.rs       # Axum HTTP API: dual-token Bearer auth, GET /api/check/:telegram_id
     ├── api_client.rs       # ApiClient: calls.okcdn.ru auth + lookup with session refresh + 429 exponential backoff
-    ├── bot_handler.rs      # Telegram handlers: /start, message, inline, group tracking; three-tier lookup
+    ├── bot_handler.rs      # Telegram handlers: /start, /plugins, /upload_assets, /delete_asset, inline, group tracking, callback queries
     ├── scheduler.rs        # Daily cron scan: returns handle for graceful shutdown; iterates chats, checks members
-    └── db.rs               # SQLite schema init, known_users + chat_members CRUD, analytics logging
+    └── db.rs               # SQLite schema init, CRUD for known_users, chat_members, api_tokens, plugin_assets, pseudonymized analytics
 ```
 
 ---
@@ -410,6 +403,7 @@ telega-checker-rs/
 - [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Inline mode enabled for the bot (via BotFather: `/setinline`)
+- A [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) token for exposing the HTTP API
 
 For local development without Docker:
 - Rust 1.92+ (edition 2024)
@@ -430,10 +424,14 @@ cp .env.example .env
 | `TELOXIDE_TOKEN` | Yes | -- | Telegram bot token from @BotFather |
 | `DATABASE_URL` | Yes | `sqlite:telega_checker.db?mode=rwc` | SQLite connection string. Overridden to `/app/data/telega_checker.db` in Docker via `docker-compose.yml`. |
 | `APPLICATION_KEY` | No | `CHKIPMKGDIHBABABA` | OK.ru API application key for `calls.okcdn.ru` authentication |
-| `API_BEARER_TOKEN` | Yes | -- | Bearer token for authenticating HTTP API requests (used by Android plugin) |
+| `API_BEARER_TOKEN` | Yes | -- | Static bearer token for HTTP API authentication (backward-compatible; also accepts per-user tokens) |
 | `API_PORT` | No | `8080` | Port for the Axum HTTP API server |
 | `DATABASE_MAX_CONNECTIONS` | No | `5` | Maximum SQLite connection pool size. Increase for deployments with many concurrent group scans. |
+| `ADMIN_ID` | Yes | -- | Telegram user ID of the bot administrator. Required for admin-only commands (`/upload_assets`, `/delete_asset`). |
+| `CLOUDFLARE_TUNNEL_TOKEN` | Yes (Docker) | -- | Cloudflare Tunnel token for the `cloudflared` service. Generate from Cloudflare Zero Trust Dashboard → Networks → Tunnels. |
 | `RUST_LOG` | No | `info` | Tracing filter directive. Set to `debug` for verbose output, `warn` for production. |
+
+**Auto-generated file:** On first startup, the application generates a `.analytics_key` file containing a cryptographic pepper (two concatenated UUID v4 values) for HMAC-SHA256 pseudonymization of analytics data. This file is placed in the same directory as the SQLite database and must persist across restarts to maintain consistent pseudonymized identifiers. See [Privacy & Analytics Pseudonymization](#privacy--analytics-pseudonymization).
 
 ---
 
@@ -441,18 +439,18 @@ cp .env.example .env
 
 ### Docker (recommended)
 
-The production topology consists of two Docker services behind Cloudflare Proxy:
+The production topology consists of two Docker services:
 
 | Service | Image | Ports (host) | Role |
 |---|---|---|---|
 | `bot` | build: `.` | None (internal) | Dual-Core Rust app (Telegram bot + HTTP API on :8080) |
-| `nginx` | `nginx:alpine` | `80`, `443` | Reverse proxy, SSL (Cloudflare Origin Cert), rate limiting |
+| `cloudflared` | `cloudflare/cloudflared:latest` | None | Cloudflare Tunnel — secure outbound-only connection to Cloudflare edge |
 
 #### Prerequisites
 
-1. **Cloudflare Origin Certificate**: Place `origin.pem` and `origin-key.pem` in `nginx/ssl/`. Generate from Cloudflare Dashboard → SSL/TLS → Origin Server.
-2. **Cloudflare SSL mode**: Set to **Full (strict)** in Dashboard → SSL/TLS → Overview.
-3. **DNS**: Point your domain to the server IP with Cloudflare Proxy enabled (orange cloud).
+1. **Cloudflare Tunnel**: Create a tunnel in [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels. Configure it to route your domain's traffic to `http://bot:8080`. Copy the tunnel token into `.env` as `CLOUDFLARE_TUNNEL_TOKEN`.
+2. **Cloudflare DNS**: Point your domain to the tunnel (automatically configured when you set up the tunnel route).
+3. **No SSL certificates required**: Cloudflare handles SSL termination at the edge. No origin certificates, no Nginx, no port forwarding.
 
 ```bash
 # Build and start in detached mode
@@ -472,16 +470,16 @@ docker compose down
 docker compose down -v
 ```
 
-The named volume `bot_data` mounts to `/app/data` inside the container. The SQLite database persists across `down` + `up` cycles.
+The named volume `bot_data` mounts to `/app/data` inside the container. The SQLite database and the `.analytics_key` file persist across `down` + `up` cycles.
 
 | Volume | Container Path | Contents |
 |---|---|---|
-| `bot_data` | `/app/data` | `telega_checker.db`, `*.db-wal`, `*.db-shm` |
+| `bot_data` | `/app/data` | `telega_checker.db`, `*.db-wal`, `*.db-shm`, `.analytics_key` |
 
 ### Local Development
 
 ```bash
-# Ensure .env is populated (including API_BEARER_TOKEN)
+# Ensure .env is populated (including API_BEARER_TOKEN and ADMIN_ID)
 cargo run --release
 ```
 
@@ -492,7 +490,7 @@ The binary reads `.env` from the working directory via `dotenvy`. Both the Teleg
 The Dockerfile implements a two-stage build:
 
 1. **Builder stage** (`rust:1.92-slim-bookworm`): Compiles the release binary with a dependency caching layer (dummy `main.rs` trick to cache compiled dependencies separately from application code).
-2. **Runtime stage** (`debian:bookworm-slim`): Minimal image with only `ca-certificates` and `libssl3`. Runs as non-root user `appuser` (UID 1001). Exposes port `8080` for the internal Docker network.
+2. **Runtime stage** (`debian:bookworm-slim`): Minimal image with only `ca-certificates` and `libssl3`. Copies the `plugins/` directory into the image for the `/upload_assets` admin command. Runs as non-root user `appuser` (UID 1001). Exposes port `8080` for the internal Docker network.
 
 ---
 
@@ -507,8 +505,8 @@ Send a numeric Telegram ID to the bot:
 ```
 
 Response:
-- Present in Telega infrastructure: `YES — this ID is registered in Telega.`
-- Not found: `NO — this ID was not found in Telega.`
+- Present in Telega infrastructure: `✅ ДА — этот ID зарегистрирован в Telega.`
+- Not found: `❌ НЕТ — этот ID не найден в Telega.`
 
 ### Inline Query
 
@@ -532,7 +530,20 @@ The bot will reply in the group with the lookup result. Invalid or empty IDs are
 
 ### /start Command
 
-Displays usage instructions and a link to the OSINT article on Telega's interception mechanics.
+Displays usage instructions, a link to the OSINT article on Telega's interception mechanics, and an inline keyboard button to download plugins and obtain a personal API token.
+
+### /plugins Command
+
+Available in private chats only. Delivers plugin files as Telegram documents (using cached `file_id` for zero bandwidth overhead), generates or retrieves the user's personal API token, and provides installation instructions. Includes a "Reset API Token" inline button for token rotation.
+
+### Admin Commands
+
+Restricted to the `ADMIN_ID` user. Filtered at both the dispatcher level and within each handler (defense-in-depth).
+
+| Command | Description |
+|---|---|
+| `/upload_assets` | Reads `.plugin` files from the `plugins/` directory, uploads them to Telegram, and stores the resulting `file_id` values in the `plugin_assets` table for subsequent zero-bandwidth delivery. |
+| `/delete_asset <name>` | Removes a specific plugin asset from the database by its derived name (e.g., `ayugram`). |
 
 ---
 
@@ -545,8 +556,13 @@ The Axum HTTP API server exposes a RESTful endpoint for external clients (e.g., 
 All API requests require a Bearer token in the `Authorization` header:
 
 ```
-Authorization: Bearer <API_BEARER_TOKEN>
+Authorization: Bearer <TOKEN>
 ```
+
+The server accepts two types of tokens (dual-token validation):
+
+1. **Static token** — the `API_BEARER_TOKEN` environment variable (backward compatibility, admin/testing use).
+2. **Per-user tokens** — UUID v4 tokens generated via the `/plugins` command and stored in the `api_tokens` table. Each user gets a unique token tied to their Telegram account, which can be rotated via the "Reset API Token" button.
 
 Requests without a valid token receive `401 Unauthorized`.
 
@@ -579,12 +595,12 @@ Check if a Telegram user ID is registered in Telega's infrastructure.
 ### Example
 
 ```bash
-curl -H "Authorization: Bearer YOUR_TOKEN" https://checker.berektassuly.com/api/check/123456789
+curl -H "Authorization: Bearer YOUR_TOKEN" https://tc.berektassuly.com/api/check/123456789
 ```
 
 ### Rate Limiting
 
-Nginx enforces **20 requests/second per IP** with a burst of 10 on all `/api/` endpoints. Excess requests receive `429 Too Many Requests`.
+Rate limiting is handled at the Cloudflare edge via WAF rules or Cloudflare Rate Limiting, replacing the previous Nginx-based approach.
 
 ---
 
@@ -637,27 +653,26 @@ CREATE TABLE IF NOT EXISTS known_users (
 );
 ```
 
-### `bot_users` (analytics)
+### `bot_users` (pseudonymized analytics)
 
-Tracks users who have interacted with the bot. Supports usage statistics and rate-limiting.
+Tracks users who have interacted with the bot via truncated HMAC-SHA256 hashes. No raw Telegram user IDs or usernames are stored.
 
 ```sql
 CREATE TABLE IF NOT EXISTS bot_users (
-    user_id    INTEGER PRIMARY KEY,
-    username   TEXT,
+    user_hash  TEXT PRIMARY KEY,
     first_seen TEXT NOT NULL DEFAULT (datetime('now')),
     last_seen  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```
 
-### `requests_log` (analytics)
+### `requests_log` (pseudonymized analytics)
 
-Append-only log of every lookup event. Enables operational monitoring and query pattern analysis.
+Append-only log of every lookup event. Uses the same HMAC-SHA256 pseudonymized identifier as `bot_users`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS requests_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
+    user_hash  TEXT    NOT NULL,
     queried_id INTEGER NOT NULL,
     result     TEXT    NOT NULL,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -677,13 +692,55 @@ CREATE TABLE IF NOT EXISTS chat_members (
 );
 ```
 
+### `api_tokens` (per-user API access)
+
+Stores per-user API tokens for authenticated HTTP API access. Each user receives a UUID v4 token on first `/plugins` request, with support for token rotation.
+
+```sql
+CREATE TABLE IF NOT EXISTS api_tokens (
+    user_id    INTEGER PRIMARY KEY,
+    api_token  TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+### `plugin_assets` (plugin delivery)
+
+Persistent storage for Telegram `file_id` values of uploaded plugin files. Enables zero-bandwidth re-delivery of plugin assets by referencing cached files on Telegram's servers.
+
+```sql
+CREATE TABLE IF NOT EXISTS plugin_assets (
+    name       TEXT PRIMARY KEY,
+    file_id    TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+---
+
+## Privacy & Analytics Pseudonymization
+
+All analytics tables (`bot_users`, `requests_log`) store pseudonymized identifiers instead of raw Telegram user IDs or usernames. This is implemented via a **zero-knowledge HMAC-SHA256** scheme:
+
+1. **Pepper generation**: On first startup, the application generates a cryptographic pepper (two concatenated UUID v4 values, 72 characters of entropy) and saves it to `.analytics_key` alongside the SQLite database. This file must persist across restarts.
+
+2. **Hashing**: Each Telegram user ID is transformed using `HMAC-SHA256(pepper, user_id_bytes)`, then truncated to 32 hex characters (128 bits). The same `(user_id, pepper)` pair always produces the same hash, preserving analytical consistency.
+
+3. **Properties**:
+   - **Deterministic**: repeated interactions from the same user produce the same hash, enabling usage statistics and deduplication.
+   - **Irreversible**: the pepper is never exposed via any API or bot command. Without the pepper, the hashes cannot be reversed to Telegram IDs.
+   - **Zero-knowledge**: the operator can observe usage patterns without identifying individual users.
+
+The `crypto.rs` module implements the hashing function. The pepper is loaded from disk by `config.rs` and injected into `AppState` for use by all handlers.
+
 ---
 
 ## Operational Security Notes
 
 The `bot_users` and `requests_log` tables are provided for operational analytics (usage statistics, debugging, rate-limiting decisions). They are not required for core detection functionality. The only table required for correct operation of the three-tier lookup is `known_users`.
 
-Operators deploying in environments where metadata minimization is a priority may disable the analytics logging by removing or commenting out the calls to `db::log_request()` and `db::log_bot_user()` in `src/bot_handler.rs`. This is a straightforward modification confined to two call sites in `handle_message` and one in `handle_inline_query`.
+Operators deploying in environments where metadata minimization is a priority may disable the analytics logging by removing or commenting out the calls to `db::log_request()` and `db::log_bot_user()` in `src/bot_handler.rs`. This is a straightforward modification confined to call sites in `handle_message`, `handle_inline_query`, and `handle_mention_lookup`.
 
 An alternative approach for operators who want analytics during development but not in production: introduce a Cargo feature flag (e.g., `analytics`) that conditionally compiles the logging code. Example `Cargo.toml` addition:
 
@@ -703,7 +760,7 @@ volumes:
     target: /app/data
 ```
 
-Note that this also makes the L2 cache (`known_users`) ephemeral, requiring all lookups to hit L3 until the cache repopulates.
+Note that this also makes the L2 cache (`known_users`), the analytics pepper (`.analytics_key`), and per-user API tokens (`api_tokens`) ephemeral, requiring all lookups to hit L3 until the cache repopulates and new tokens to be issued on every restart.
 
 ---
 
