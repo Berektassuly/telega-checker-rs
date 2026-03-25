@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     info!("Bot connected. Setting up handlers...");
 
     // ── Start the daily scan scheduler ──
-    let scheduler_handle = scheduler::start_daily_scan(bot.clone(), state.clone())
+    let mut scheduler_handle = scheduler::start_daily_scan(bot.clone(), state.clone())
         .await
         .context("Failed to start daily scan scheduler")?;
 
