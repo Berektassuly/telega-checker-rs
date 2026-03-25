@@ -294,3 +294,13 @@ pub async fn get_plugin_assets(pool: &SqlitePool) -> Result<Vec<(String, String)
     .await?;
     Ok(rows)
 }
+
+/// Delete a specific plugin asset by name.
+pub async fn delete_plugin_asset(pool: &SqlitePool, name: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM plugin_assets WHERE name = ?")
+        .bind(name)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected() > 0)
+}

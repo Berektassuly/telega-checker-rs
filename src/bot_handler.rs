@@ -218,6 +218,63 @@ pub async fn handle_upload_assets(
     Ok(())
 }
 
+// ─── /delete_asset command handler (admin only) ─────────────────────────────
+
+/// Handle the /delete_asset command: remove a plugin asset from the database.
+pub async fn handle_delete_asset(
+    bot: Bot,
+    msg: Message,
+    state: AppState,
+    asset_name: String,
+) -> Result<(), teloxide::RequestError> {
+    let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+
+    // Admin guard
+    if user_id != state.admin_id {
+        warn!(user_id, "Unauthorized /delete_asset attempt");
+        return Ok(());
+    }
+
+    let asset_name = asset_name.trim();
+
+    if asset_name.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "Пожалуйста, укажите имя плагина. Пример: <code>/delete_asset ayugram</code>",
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    match db::delete_plugin_asset(&state.pool, asset_name).await {
+        Ok(true) => {
+            info!(asset_name, "Plugin asset deleted successfully");
+            bot.send_message(
+                msg.chat.id,
+                format!("Плагин <b>{}</b> успешно удалён.", asset_name),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        Ok(false) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("Плагин <b>{}</b> не найден.", asset_name),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+        }
+        Err(e) => {
+            error!(asset_name, "Failed to delete plugin asset: {}", e);
+            bot.send_message(msg.chat.id, "Произошла ошибка при удалении плагина.")
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Callback query handler ────────────────────────────────────────────────
 
 /// Handle inline button callbacks: "get_plugins" and "reset_token".

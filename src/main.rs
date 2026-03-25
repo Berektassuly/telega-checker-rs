@@ -250,6 +250,8 @@ enum BotCommands {
 enum AdminCommands {
     /// Upload plugin assets (admin only)
     UploadAssets,
+    /// Delete a specific plugin asset (admin only)
+    DeleteAsset(String),
 }
 
 /// Route user commands to their respective handlers.
@@ -274,5 +276,6 @@ async fn admin_commands_handler(
 ) -> Result<(), teloxide::RequestError> {
     match cmd {
         AdminCommands::UploadAssets => bot_handler::handle_upload_assets(bot, msg, state).await,
+        AdminCommands::DeleteAsset(name) => bot_handler::handle_delete_asset(bot, msg, state, name).await,
     }
 }
